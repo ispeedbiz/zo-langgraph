@@ -177,17 +177,64 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
         logger.error("Research Mind B CRASHED: %s", e, exc_info=True)
         return {"status": "failed", "stage": "research_b", "error": str(e)}
 
+    # Log FULL state for debugging
+    logger.info(
+        "Research Mind B state: status=%s, error=%s, keys=%s, evals=%d, go=%d",
+        state_b.get("status"), state_b.get("error"),
+        list(state_b.keys()),
+        len(state_b.get("evaluations", [])),
+        len(state_b.get("go_ideas", [])),
+    )
+
     if state_b.get("error"):
         logger.error("Research Mind B returned error: %s", state_b["error"])
-        return {"status": "failed", "stage": "research_b", "error": state_b["error"]}
+        # Emergency recovery — try to extract evaluations from raw response
+        if not state_b.get("evaluations") and not state_b.get("go_ideas"):
+            raw_b = state_b.get("research_text", "") or state_b.get("evaluation_text", "")
+            if raw_b:
+                logger.info("B→Ethics emergency: attempting extraction from %d chars", len(raw_b))
+                from .graphs.shared import extract_json
+                parsed_b = extract_json(raw_b)
+                if parsed_b:
+                    evals = parsed_b if isinstance(parsed_b, list) else parsed_b.get("evaluations", [])
+                    if evals:
+                        # Recompute go_ideas from evaluations
+                        go = [e.get("name") for e in evals
+                              if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
+                        logger.info("Emergency: found %d evals, %d GO ideas", len(evals), len(go))
+                        state_b["evaluations"] = evals
+                        state_b["go_ideas"] = go
+                        state_b["go_evaluations"] = [e for e in evals if e.get("name") in go]
+                        state_b["error"] = None
+                    else:
+                        logger.error("Emergency: got JSON but no evaluations array")
+                        logger.error("Parsed keys: %s", list(parsed_b.keys()) if isinstance(parsed_b, dict) else "list")
+                else:
+                    logger.error("Emergency extraction failed. Preview: %.500s", raw_b[:500])
+            else:
+                logger.error("No raw text available for emergency extraction")
+                logger.error("State B keys: %s", list(state_b.keys()))
+
+        if state_b.get("error"):
+            return {"status": "failed", "stage": "research_b", "error": state_b["error"]}
 
     go_ideas = state_b.get("go_ideas", [])
     go_evaluations = state_b.get("go_evaluations", state_b.get("evaluations", []))
-    logger.info("Research Mind B complete: %d GO ideas out of %d", len(go_ideas), len(ideas))
+    logger.info("Research Mind B complete: %d GO ideas out of %d evaluated", len(go_ideas), len(ideas))
 
     if not go_ideas:
-        logger.warning("Research Mind B found 0 GO ideas — stopping pipeline")
-        return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
+        # Don't give up — if we have evaluations, compute GO ideas from scores
+        all_evals = state_b.get("evaluations", [])
+        if all_evals:
+            logger.info("No go_ideas but %d evaluations exist — recomputing", len(all_evals))
+            go_ideas = [e.get("name") for e in all_evals
+                        if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
+            go_evaluations = [e for e in all_evals if e.get("name") in go_ideas]
+            logger.info("Recomputed: %d GO ideas", len(go_ideas))
+
+        if not go_ideas:
+            logger.warning("Research Mind B found 0 GO ideas — stopping pipeline")
+            return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
 
     # Step 3: Ethics Mind — approve/block
     logger.info("═══ PIPELINE STEP 3/3: Ethics Mind starting (%d GO ideas) ═══", len(go_ideas))
