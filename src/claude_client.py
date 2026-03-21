@@ -20,7 +20,10 @@ class ClaudeClient:
     """Tiered, cost-tracked Claude API client."""
 
     def __init__(self):
-        self.client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
+        self.client = anthropic.AsyncAnthropic(
+            api_key=config.anthropic_api_key,
+            timeout=300.0,  # 5 min max per API call — prevent infinite hangs
+        )
 
     async def call(
         self,

@@ -105,7 +105,20 @@ async def review_ethics(state: EthicsState) -> EthicsState:
 
     # Build the user message with idea details and their evaluations
     ideas_for_review = []
-    go_names = {e.get("idea_name") or e.get("name") for e in evaluations if e.get("verdict") == "GO"}
+    # Match GO ideas — Research B uses "decision" field, not "verdict"
+    go_names = {
+        e.get("idea_name") or e.get("name")
+        for e in evaluations
+        if e.get("verdict") == "GO" or e.get("decision") == "GO"
+           or (e.get("weighted_score") or 0) >= 7.0
+    }
+    logger.info("Ethics review: %d GO names from %d evaluations: %s", len(go_names), len(evaluations), go_names)
+
+    # If go_names is empty but we have evaluations, use ALL evaluations
+    # (they were pre-filtered to GO ideas in run_ethics)
+    if not go_names and evaluations:
+        go_names = {e.get("idea_name") or e.get("name") for e in evaluations}
+        logger.info("Fallback: using all %d evaluation names as GO", len(go_names))
 
     for idea in ideas:
         idea_name = idea.get("name", "")
@@ -458,7 +471,9 @@ async def run_ethics(
     go_names_set = set(go_ideas)
     go_evaluations = [
         e for e in evaluations
-        if (e.get("idea_name") or e.get("name")) in go_names_set or e.get("verdict") == "GO"
+        if (e.get("idea_name") or e.get("name")) in go_names_set
+           or e.get("verdict") == "GO" or e.get("decision") == "GO"
+           or (e.get("weighted_score") or 0) >= 7.0
     ]
 
     initial_state: EthicsState = {
