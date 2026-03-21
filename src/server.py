@@ -2,16 +2,23 @@
 FastAPI server — The LangGraph service entry point.
 Receives events from n8n webhooks and Telegram commands.
 Orchestrates all AI agent pipelines.
+
+v2.1 — Graphs wired. Every handler executes real LangGraph agents.
 """
 
-from fastapi import FastAPI, HTTPException
+import asyncio
+import logging
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Any
 from . import db
+from .graphs import run_research_a, run_research_b, run_ethics, run_builder, run_qa, run_marketing
+
+logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.0.0",
+    version="2.1.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -44,17 +51,19 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.0.0",
-        "ecosystem_status": await db.get_config("ecosystem_status", "unknown"),
+        "version": "2.1.0",
+        "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
+        "ecosystem_status": await db.get_config("ecosystem_status", "active"),
     }
 
 
 # ── Event Processing ───────────────────────────────────
 
 @app.post("/events/process")
-async def process_event(req: PipelineEventRequest):
+async def process_event(req: PipelineEventRequest, background_tasks: BackgroundTasks):
     """Process a pipeline event from n8n or internal trigger.
-    This is the main router — it decides which graph to run."""
+    This is the main router — it decides which graph to run.
+    Long-running graphs execute in the background."""
 
     event = await db.emit_event(
         event_type=req.event_type,
@@ -65,6 +74,7 @@ async def process_event(req: PipelineEventRequest):
 
     # Route to the appropriate pipeline graph
     handlers = {
+        "research_trigger": _handle_research_trigger,
         "research_complete": _handle_research_complete,
         "evaluation_complete": _handle_evaluation_complete,
         "human_approved": _handle_human_approved,
@@ -76,102 +86,210 @@ async def process_event(req: PipelineEventRequest):
 
     handler = handlers.get(req.event_type)
     if handler:
-        result = await handler(req.project_id, req.payload)
-        await db.mark_event_processed(event["id"])
-        return {"status": "processed", "event_id": event["id"], "result": result}
+        # Run graph in background — return immediately so n8n/Telegram doesn't timeout
+        background_tasks.add_task(_run_handler_safe, handler, req.project_id, req.payload, event["id"])
+        return {"status": "accepted", "event_id": event["id"], "handler": req.event_type}
 
     # Events that don't need LangGraph processing (just logged)
     await db.mark_event_processed(event["id"])
     return {"status": "logged", "event_id": event["id"]}
 
 
+async def _run_handler_safe(handler, project_id, payload, event_id):
+    """Run a handler with error catching — never crash the server."""
+    try:
+        result = await handler(project_id, payload)
+        await db.mark_event_processed(event_id)
+        logger.info(f"Handler completed: {result}")
+    except Exception as e:
+        logger.error(f"Handler failed: {e}", exc_info=True)
+        await db.mark_event_processed(event_id, error=str(e))
+
+
 # ── Pipeline Handlers ──────────────────────────────────
-# Each handler calls the appropriate LangGraph graph.
-# Graphs are defined in src/graphs/ (to be built next).
+# Each handler calls the real LangGraph graph.
+
+async def _handle_research_trigger(project_id: str | None, payload: dict) -> dict:
+    """Start the full research pipeline: Agent A → Agent B → Ethics."""
+    # Step 1: Research Mind A — generate ideas
+    state_a = await run_research_a(config_overrides=payload)
+
+    if state_a.get("error"):
+        return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
+
+    # Step 2: Research Mind B — evaluate ideas
+    ideas = state_a.get("ideas", [])
+    if not ideas:
+        return {"status": "completed", "stage": "research_a", "result": "no_ideas_generated"}
+
+    state_b = await run_research_b(ideas=ideas, batch_id=state_a.get("batch_id", ""))
+
+    if state_b.get("error"):
+        return {"status": "failed", "stage": "research_b", "error": state_b["error"]}
+
+    # Step 3: Ethics Mind — approve/block
+    go_ideas = state_b.get("go_ideas", [])
+    go_evaluations = state_b.get("go_evaluations", state_b.get("evaluations", []))
+    if not go_ideas:
+        return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
+
+    state_ethics = await run_ethics(
+        ideas=ideas,
+        evaluations=go_evaluations,
+        go_ideas=go_ideas,
+    )
+
+    return {
+        "status": "completed",
+        "ideas_generated": len(ideas),
+        "go_ideas": len(go_ideas),
+        "auto_approved": len(state_ethics.get("auto_approved", [])),
+        "pending_approval": len(state_ethics.get("pending_approval", [])),
+        "blocked": len(state_ethics.get("blocked", [])),
+        "total_cost_usd": round(
+            state_a.get("total_cost_usd", 0) +
+            state_b.get("total_cost_usd", 0) +
+            state_ethics.get("total_cost_usd", 0), 4
+        ),
+    }
+
 
 async def _handle_research_complete(project_id: str | None, payload: dict) -> dict:
     """Research Agent A finished → run Research Agent B (evaluation)."""
-    # TODO: Import and run evaluation graph
-    await db.emit_event("evaluation_started", project_id, "langgraph", payload)
-    return {"next": "evaluation_pipeline", "project_id": project_id}
+    ideas = payload.get("ideas", [])
+    batch_id = payload.get("batch_id", "")
+
+    if not ideas:
+        return {"status": "skipped", "reason": "no ideas in payload"}
+
+    state = await run_research_b(ideas=ideas, batch_id=batch_id)
+    return {
+        "status": state.get("status", "unknown"),
+        "go_ideas": state.get("go_ideas", []),
+        "cost_usd": state.get("total_cost_usd", 0),
+    }
 
 
 async def _handle_evaluation_complete(project_id: str | None, payload: dict) -> dict:
     """Research Agent B finished → run Ethics Agent."""
-    await db.emit_event("ethics_started", project_id, "langgraph", payload)
-    return {"next": "ethics_pipeline", "project_id": project_id}
+    ideas = payload.get("ideas", [])
+    evaluations = payload.get("evaluations", payload.get("go_evaluations", []))
+    go_ideas = payload.get("go_ideas", [])
+
+    if not go_ideas:
+        return {"status": "skipped", "reason": "no go ideas"}
+
+    state = await run_ethics(ideas=ideas, evaluations=evaluations, go_ideas=go_ideas)
+    return {
+        "status": state.get("status", "unknown"),
+        "auto_approved": len(state.get("auto_approved", [])),
+        "pending_approval": len(state.get("pending_approval", [])),
+        "blocked": len(state.get("blocked", [])),
+        "cost_usd": state.get("total_cost_usd", 0),
+    }
 
 
 async def _handle_human_approved(project_id: str | None, payload: dict) -> dict:
     """Human approved via Telegram → start Build pipeline."""
+    if not project_id:
+        return {"status": "error", "reason": "no project_id"}
+
     # Check for existing checkpoint (resume if available)
     checkpoint = await db.get_latest_checkpoint(project_id, "build_pipeline")
+    resume_from = None
     if checkpoint:
-        return {
-            "next": "build_pipeline",
-            "mode": "resume",
-            "from_step": checkpoint["step_number"],
-            "project_id": project_id,
-        }
+        resume_from = checkpoint.get("step_number")
+        logger.info(f"Resuming build for {project_id} from step {resume_from}")
 
-    await db.emit_event("build_started", project_id, "langgraph", payload)
-    return {"next": "build_pipeline", "mode": "fresh", "project_id": project_id}
+    state = await run_builder(project_id=project_id, resume_from=resume_from)
+    return {
+        "status": state.get("status", "unknown"),
+        "steps_completed": state.get("current_step", 0),
+        "cost_usd": state.get("total_cost_usd", 0),
+    }
 
 
 async def _handle_build_complete(project_id: str | None, payload: dict) -> dict:
     """Build finished → trigger QA pipeline."""
-    await db.emit_event("qa_started", project_id, "langgraph", payload)
-    return {"next": "qa_pipeline", "project_id": project_id}
+    if not project_id:
+        return {"status": "error", "reason": "no project_id"}
+
+    state = await run_qa(project_id=project_id)
+    return {
+        "status": state.get("status", "unknown"),
+        "score": f"{state.get('overall_score', 0)}/{state.get('max_score', 140)}",
+        "passed": state.get("passed", False),
+        "cost_usd": state.get("total_cost_usd", 0),
+    }
 
 
 async def _handle_qa_passed(project_id: str | None, payload: dict) -> dict:
-    """QA passed → trigger Launch (handled by n8n for Netlify/Stripe/DNS)."""
+    """QA passed → trigger Launch (infrastructure handled by n8n)."""
+    # Emit event for n8n Workflow A to handle Netlify/Stripe/DNS
     await db.emit_event("launch_started", project_id, "langgraph", payload)
     return {"next": "launch_pipeline_n8n", "project_id": project_id}
 
 
 async def _handle_launched(project_id: str | None, payload: dict) -> dict:
     """Product launched → trigger Marketing pipeline."""
-    await db.emit_event("marketing_started", project_id, "langgraph", payload)
-    return {"next": "marketing_pipeline", "project_id": project_id}
+    if not project_id:
+        return {"status": "error", "reason": "no project_id"}
+
+    state = await run_marketing(project_id=project_id)
+    return {
+        "status": state.get("status", "unknown"),
+        "linkedin_posts": len(state.get("linkedin_posts", [])),
+        "twitter_posts": len(state.get("twitter_posts", [])),
+        "email_sequence": len(state.get("email_welcome_sequence", [])),
+        "cost_usd": state.get("total_cost_usd", 0),
+    }
 
 
 async def _handle_manual_trigger(project_id: str | None, payload: dict) -> dict:
     """Manual trigger from Telegram command."""
     pipeline = payload.get("pipeline", "")
-    return {"next": f"{pipeline}_pipeline", "mode": "manual", "project_id": project_id}
+
+    if pipeline == "research":
+        return await _handle_research_trigger(project_id, payload)
+    elif pipeline == "build" and project_id:
+        return await _handle_human_approved(project_id, payload)
+    elif pipeline == "qa" and project_id:
+        return await _handle_build_complete(project_id, payload)
+    elif pipeline == "marketing" and project_id:
+        return await _handle_launched(project_id, payload)
+
+    return {"status": "error", "reason": f"unknown pipeline: {pipeline}"}
 
 
 # ── Telegram Commands ──────────────────────────────────
 
 @app.post("/telegram/command")
-async def telegram_command(req: TelegramCommandRequest):
+async def telegram_command(req: TelegramCommandRequest, background_tasks: BackgroundTasks):
     """Handle Telegram bot commands: /research, /status, /costs, /health."""
 
     if req.command == "/research":
-        await db.emit_event("manual_trigger", None, "telegram", {"pipeline": "research"})
-        return {"response": "Research pipeline started. I'll send results when ready."}
+        background_tasks.add_task(_run_handler_safe, _handle_research_trigger, None, {}, "telegram-research")
+        return {"response": "🔬 Research pipeline started. I'll send results when ready."}
 
     elif req.command == "/status":
         client = db.get_client()
         projects = client.table("zo_projects").select("name, status").execute()
-        status_lines = [f"* {p['name']}: {p['status']}" for p in (projects.data or [])]
-        ecosystem_status = await db.get_config("ecosystem_status", "unknown")
+        status_lines = [f"• {p['name']}: {p['status']}" for p in (projects.data or [])]
+        ecosystem_status = await db.get_config("ecosystem_status", "active")
         return {
-            "response": f"Ecosystem: {ecosystem_status}\n\n" + "\n".join(status_lines) if status_lines else "No projects found."
+            "response": f"🟢 Ecosystem: {ecosystem_status}\n\n" + "\n".join(status_lines) if status_lines else "No projects found."
         }
 
     elif req.command == "/costs":
         client = db.get_client()
-        # Get this week's costs
         costs = client.rpc("get_weekly_costs", {}).execute()
-        return {"response": f"Cost data: {costs.data}"}
+        return {"response": f"📊 Cost data: {costs.data}"}
 
     elif req.command == "/health":
         client = db.get_client()
         projects = client.table("zo_projects").select("name, status, mrr, monthly_users").eq("status", "live").execute()
-        lines = [f"* {p['name']}: {p['monthly_users']} users, ${p['mrr']} MRR" for p in (projects.data or [])]
-        return {"response": "Live Products:\n" + "\n".join(lines) if lines else "No live products."}
+        lines = [f"• {p['name']}: {p['monthly_users']} users, ${p['mrr']} MRR" for p in (projects.data or [])]
+        return {"response": "📱 Live Products:\n" + "\n".join(lines) if lines else "No live products yet."}
 
     return {"response": f"Unknown command: {req.command}"}
 
@@ -182,10 +300,7 @@ async def telegram_command(req: TelegramCommandRequest):
 async def cost_dashboard():
     """Return cost breakdown for the dashboard."""
     client = db.get_client()
-
-    # Total costs by tier
     result = client.rpc("get_cost_summary", {}).execute()
-
     return {
         "summary": result.data if result.data else [],
         "ecosystem_status": await db.get_config("ecosystem_status"),
@@ -199,3 +314,13 @@ async def get_learnings(category: str, limit: int = 20):
     """Get ecosystem learnings for pre-build injection."""
     learnings = await db.get_learnings_for_category(category, limit)
     return {"learnings": learnings, "count": len(learnings)}
+
+
+# ── Full Pipeline Endpoint ─────────────────────────────
+
+@app.post("/pipeline/research")
+async def start_research_pipeline(background_tasks: BackgroundTasks):
+    """Start the full autonomous research pipeline: A → B → Ethics → Auto-approve."""
+    event = await db.emit_event("research_trigger", None, "api", {})
+    background_tasks.add_task(_run_handler_safe, _handle_research_trigger, None, {}, event["id"])
+    return {"status": "accepted", "event_id": event["id"], "pipeline": "research → evaluation → ethics → approve"}
