@@ -19,7 +19,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.6.1",
+    version="2.6.2",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +60,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.6.1",
+        "version": "2.6.2",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -73,6 +73,66 @@ async def debug_last_error():
         "last_error": _last_pipeline_error,
         "last_result": _last_pipeline_result,
     }
+
+
+@app.get("/debug/test-db-write")
+async def test_db_write():
+    """Test DB write functions without triggering pipeline. Costs $0."""
+    results = {}
+
+    # Test 1: Write to zo_projects
+    test_id = "zo-test-dbwrite"
+    try:
+        proj = await db.create_project(test_id, {
+            "name": "DB Write Test",
+            "category": "test",
+            "status": "test",
+        })
+        results["zo_projects_insert"] = {"success": True, "data": str(proj)[:200]}
+    except Exception as e:
+        results["zo_projects_insert"] = {"success": False, "error": str(e)[:300]}
+
+    # Test 2: Write to ethics_reviews
+    try:
+        import json as _json
+        client = db.get_client()
+        client.table("ethics_reviews").insert({
+            "project_id": "test-batch",
+            "idea_name": "DB Write Test",
+            "verdict": "APPROVED",
+            "ethical_score": 9.0,
+            "concerns": _json.dumps([]),
+            "required_fixes": _json.dumps([]),
+            "reasoning": "Test write",
+            "batch_id": "test-batch",
+        }).execute()
+        results["ethics_reviews_insert"] = {"success": True}
+    except Exception as e:
+        results["ethics_reviews_insert"] = {"success": False, "error": str(e)[:300]}
+
+    # Test 3: Check zo_projects schema
+    try:
+        client = db.get_client()
+        schema = client.table("zo_projects").select("*").limit(1).execute()
+        if schema.data:
+            results["zo_projects_columns"] = list(schema.data[0].keys())
+        else:
+            results["zo_projects_columns"] = "empty table"
+    except Exception as e:
+        results["zo_projects_columns"] = {"error": str(e)[:200]}
+
+    # Test 4: Check ethics_reviews schema
+    try:
+        client = db.get_client()
+        schema = client.table("ethics_reviews").select("*").limit(1).execute()
+        if schema.data:
+            results["ethics_reviews_columns"] = list(schema.data[0].keys())
+        else:
+            results["ethics_reviews_columns"] = "empty table"
+    except Exception as e:
+        results["ethics_reviews_columns"] = {"error": str(e)[:200]}
+
+    return results
 
 
 # ── Event Processing ───────────────────────────────────
