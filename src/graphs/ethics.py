@@ -678,25 +678,34 @@ async def emit_results(state: EthicsState) -> EthicsState:
         client = db.get_client()
         rows = []
         for review in all_reviews:
+            # Ensure ethical_score is a number
+            score = review.get("ethical_score", 0)
+            try:
+                score = float(score)
+            except (ValueError, TypeError):
+                score = 0
+
             rows.append({
-                "project_id": project_id,
-                "idea_name": review.get("name"),
-                "name": review.get("name"),
+                "project_id": project_id or "batch",
+                "idea_name": review.get("name", "unknown"),
                 "verdict": (review.get("verdict") or "NEEDS_FIXES").upper(),
-                "ethical_score": review.get("ethical_score"),
-                "concerns": review.get("concerns", []),
-                "required_fixes": review.get("required_fixes", []),
-                "reasoning": review.get("reasoning", ""),
-                "batch_id": state.get("project_id"),
+                "ethical_score": score,
+                "concerns": json.dumps(review.get("concerns", [])),
+                "required_fixes": json.dumps(review.get("required_fixes", [])),
+                "reasoning": (review.get("reasoning") or "")[:1000],
+                "batch_id": state.get("project_id") or "batch",
             })
 
-        try:
-            # Use insert (not upsert) — avoids needing unique constraint
-            # If duplicate, Supabase will auto-assign new UUID primary key
-            client.table("ethics_reviews").insert(rows).execute()
-            logger.info(f"Stored {len(rows)} ethics reviews in Supabase")
-        except Exception as e:
-            logger.error(f"Failed to store ethics reviews: {e}", exc_info=True)
+        # Insert one at a time for better error isolation
+        stored = 0
+        for row in rows:
+            try:
+                client.table("ethics_reviews").insert(row).execute()
+                stored += 1
+            except Exception as e:
+                logger.error("Failed to insert ethics review '%s': %s (row keys: %s)",
+                            row.get("idea_name"), e, list(row.keys()))
+        logger.info(f"Stored {stored}/{len(rows)} ethics reviews in Supabase")
 
     # Save checkpoint
     await db.save_checkpoint(

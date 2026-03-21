@@ -2,10 +2,13 @@
 Supabase client + helper functions for the event bus, state, and learnings.
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Any
 from supabase import create_client, Client
 from .config import config
+
+logger = logging.getLogger("zo.db")
 
 
 def get_client() -> Client:
@@ -195,25 +198,49 @@ async def get_config(key: str, default: str = "") -> str:
 async def create_project(project_id: str, idea_data: dict) -> dict:
     """Create a new project record from approved idea data."""
     client = get_client()
-    result = client.table("zo_projects").insert({
-        "id": project_id,
+    row = {
+        "project_id": project_id,
+        "product_name": idea_data.get("name", ""),
         "name": idea_data.get("name", ""),
         "category": idea_data.get("category", ""),
-        "description": idea_data.get("description") or idea_data.get("solution", ""),
-        "target_audience": idea_data.get("target_audience") or idea_data.get("audience", ""),
-        "status": "approved",
+        "status": idea_data.get("status", "approved"),
         "product_tier": idea_data.get("tier") or idea_data.get("product_tier", 3),
-    }).execute()
-    return result.data[0] if result.data else {}
+    }
+    try:
+        result = client.table("zo_projects").insert(row).execute()
+        logger.info("Created project %s: %s", project_id, result.data)
+        return result.data[0] if result.data else {}
+    except Exception as e:
+        logger.error("Failed to create project %s: %s (row: %s)", project_id, e, row)
+        # Try with 'id' instead of 'project_id' (different schema versions)
+        try:
+            row["id"] = row.pop("project_id")
+            result = client.table("zo_projects").insert(row).execute()
+            logger.info("Created project (id variant) %s: %s", project_id, result.data)
+            return result.data[0] if result.data else {}
+        except Exception as e2:
+            logger.error("Both insert variants failed for %s: %s", project_id, e2)
+            return {}
 
 
 async def get_project(project_id: str) -> dict | None:
-    """Get project details."""
+    """Get project details — tries both 'project_id' and 'id' columns."""
     client = get_client()
+    # Try project_id first
     result = (
         client.table("zo_projects")
         .select("*")
         .eq("project_id", project_id)
+        .limit(1)
+        .execute()
+    )
+    if result.data:
+        return result.data[0]
+    # Fallback: try 'id'
+    result = (
+        client.table("zo_projects")
+        .select("*")
+        .eq("id", project_id)
         .limit(1)
         .execute()
     )
