@@ -467,6 +467,10 @@ async def parse_evaluations(state: ResearchState) -> ResearchState:
         ev["weighted_score"] = computed_score
         ev["decision"] = "GO" if computed_score >= GO_THRESHOLD else "NO-GO"
 
+        # Promote tier to top level for downstream consumers
+        ev["product_tier"] = (ev.get("product_tier") or ev.get("tier")
+                              or (ev.get("build_cost") or {}).get("tier", 3))
+
         # Get idea name — handle both "idea_name" and "name"
         idea_name = ev.get("idea_name") or ev.get("name") or "unknown"
 

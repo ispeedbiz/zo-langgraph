@@ -191,7 +191,7 @@ async def generate_social(state: MarketingState) -> MarketingState:
     """Generate social media content across LinkedIn, Twitter/X, and community channels."""
 
     project = state["project"]
-    product_name = project.get("product_name", "Unknown Product")
+    product_name = project.get("product_name") or project.get("name", "Unknown Product")
     category = project.get("category", "SaaS")
     description = project.get("description", "")
     deploy_url = project.get("deploy_url", "")
@@ -282,7 +282,7 @@ async def generate_launch_content(state: MarketingState) -> MarketingState:
         return state
 
     project = state["project"]
-    product_name = project.get("product_name", "Unknown Product")
+    product_name = project.get("product_name") or project.get("name", "Unknown Product")
     category = project.get("category", "SaaS")
     description = project.get("description", "")
     deploy_url = project.get("deploy_url", "")
@@ -381,7 +381,7 @@ async def generate_email_sequence(state: MarketingState) -> MarketingState:
         return state
 
     project = state["project"]
-    product_name = project.get("product_name", "Unknown Product")
+    product_name = project.get("product_name") or project.get("name", "Unknown Product")
     category = project.get("category", "SaaS")
     description = project.get("description", "")
     deploy_url = project.get("deploy_url", "")

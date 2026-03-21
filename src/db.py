@@ -192,6 +192,21 @@ async def get_config(key: str, default: str = "") -> str:
     return default
 
 
+async def create_project(project_id: str, idea_data: dict) -> dict:
+    """Create a new project record from approved idea data."""
+    client = get_client()
+    result = client.table("zo_projects").insert({
+        "id": project_id,
+        "name": idea_data.get("name", ""),
+        "category": idea_data.get("category", ""),
+        "description": idea_data.get("description") or idea_data.get("solution", ""),
+        "target_audience": idea_data.get("target_audience") or idea_data.get("audience", ""),
+        "status": "approved",
+        "product_tier": idea_data.get("tier") or idea_data.get("product_tier", 3),
+    }).execute()
+    return result.data[0] if result.data else {}
+
+
 async def get_project(project_id: str) -> dict | None:
     """Get project details."""
     client = get_client()

@@ -199,12 +199,12 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
                     evals = parsed_b if isinstance(parsed_b, list) else parsed_b.get("evaluations", [])
                     if evals:
                         # Recompute go_ideas from evaluations
-                        go = [e.get("name") for e in evals
+                        go = [e.get("idea_name") or e.get("name") for e in evals
                               if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
                         logger.info("Emergency: found %d evals, %d GO ideas", len(evals), len(go))
                         state_b["evaluations"] = evals
                         state_b["go_ideas"] = go
-                        state_b["go_evaluations"] = [e for e in evals if e.get("name") in go]
+                        state_b["go_evaluations"] = [e for e in evals if (e.get("idea_name") or e.get("name")) in go]
                         state_b["error"] = None
                     else:
                         logger.error("Emergency: got JSON but no evaluations array")
@@ -227,9 +227,9 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
         all_evals = state_b.get("evaluations", [])
         if all_evals:
             logger.info("No go_ideas but %d evaluations exist — recomputing", len(all_evals))
-            go_ideas = [e.get("name") for e in all_evals
+            go_ideas = [e.get("idea_name") or e.get("name") for e in all_evals
                         if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
-            go_evaluations = [e for e in all_evals if e.get("name") in go_ideas]
+            go_evaluations = [e for e in all_evals if (e.get("idea_name") or e.get("name")) in go_ideas]
             logger.info("Recomputed: %d GO ideas", len(go_ideas))
 
         if not go_ideas:
@@ -292,6 +292,11 @@ async def _handle_research_complete(project_id: str | None, payload: dict) -> di
 async def _handle_evaluation_complete(project_id: str | None, payload: dict) -> dict:
     """Research Agent B finished → run Ethics Agent."""
     ideas = payload.get("ideas", [])
+    if not ideas:
+        # Ideas aren't in the event payload — load from Research A checkpoint
+        checkpoint = await db.get_latest_checkpoint(project_id or payload.get("batch_id", ""), "research_a")
+        if checkpoint:
+            ideas = checkpoint.get("state_data", {}).get("ideas", [])
     evaluations = payload.get("evaluations", payload.get("go_evaluations", []))
     go_ideas = payload.get("go_ideas", [])
 
@@ -310,6 +315,17 @@ async def _handle_evaluation_complete(project_id: str | None, payload: dict) -> 
 
 async def _handle_human_approved(project_id: str | None, payload: dict) -> dict:
     """Human approved via Telegram → start Build pipeline."""
+    idea_name = payload.get("name", "")
+    # Create project record if it doesn't exist
+    if not project_id or project_id == "batch":
+        project_id = f"zo-{idea_name.lower().replace(' ', '-')}"
+        try:
+            existing = await db.get_project(project_id)
+        except Exception:
+            existing = None
+        if not existing:
+            await db.create_project(project_id, payload)
+
     if not project_id:
         return {"status": "error", "reason": "no project_id"}
 

@@ -393,11 +393,11 @@ async def review_ethics(state: EthicsState) -> EthicsState:
         ideas_for_review.append({
             "name": idea_name,
             "category": idea.get("category", "unknown"),
-            "description": idea.get("description", ""),
-            "target_audience": idea.get("target_audience", ""),
+            "description": idea.get("description") or idea.get("solution", ""),
+            "target_audience": idea.get("target_audience") or idea.get("audience", ""),
             "monetization": idea.get("monetization", ""),
-            "evaluation_score": eval_data.get("total_score", "N/A"),
-            "evaluation_verdict": eval_data.get("verdict", "N/A"),
+            "evaluation_score": eval_data.get("weighted_score") or eval_data.get("total_score", "N/A"),
+            "evaluation_verdict": eval_data.get("decision") or eval_data.get("verdict", "N/A"),
             "tier": eval_data.get("tier", "N/A"),
             "market_analysis": eval_data.get("market_analysis", ""),
         })
@@ -518,7 +518,12 @@ async def classify_tiers(state: EthicsState) -> EthicsState:
         idea_name = review.get("name")
         ethical_score = review.get("ethical_score", 0)
         eval_data = eval_lookup.get(idea_name, {})
-        tier = eval_data.get("tier", 99)
+        tier = (
+            eval_data.get("tier")
+            or eval_data.get("product_tier")
+            or (eval_data.get("build_cost") or {}).get("tier")
+            or 99
+        )
 
         # Parse tier if it's a string like "Tier 1" or "1"
         if isinstance(tier, str):
