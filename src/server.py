@@ -19,7 +19,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.5.1",
+    version="2.5.2",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +60,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.5.1",
+        "version": "2.5.2",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -275,6 +275,19 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
 
     # Step 3: Ethics Mind — approve/block
     logger.info("═══ PIPELINE STEP 3/3: Ethics Mind starting (%d GO ideas) ═══", len(go_ideas))
+    logger.info("Ethics input — go_ideas names: %s", go_ideas)
+    logger.info("Ethics input — idea names from A: %s", [i.get("name") for i in ideas])
+    logger.info("Ethics input — eval names from B: %s", [e.get("idea_name") or e.get("name") for e in go_evaluations])
+
+    # Store in debug for visibility
+    _last_pipeline_result["ethics_input"] = {
+        "go_ideas": go_ideas,
+        "idea_names_from_a": [i.get("name") for i in ideas],
+        "eval_names_from_b": [e.get("idea_name") or e.get("name") for e in go_evaluations],
+        "eval_decisions": [e.get("decision") or e.get("verdict") for e in go_evaluations],
+        "eval_scores": [e.get("weighted_score") for e in go_evaluations],
+    }
+
     try:
         state_ethics = await run_ethics(
             ideas=ideas,
