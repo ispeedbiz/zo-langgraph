@@ -402,13 +402,31 @@ async def review_ethics(state: EthicsState) -> EthicsState:
             "market_analysis": eval_data.get("market_analysis", ""),
         })
 
+    logger.info("Ethics review_ethics: %d ideas_for_review built from %d ideas x %d go_names",
+                len(ideas_for_review), len(ideas), len(go_names))
+
     if not ideas_for_review:
         logger.warning("No GO ideas to review — skipping ethics.")
-        return {
-            **state,
-            "reviews": [],
-            "status": "skipped_no_ideas",
-        }
+        logger.warning("  go_names = %s", go_names)
+        logger.warning("  idea names = %s", [i.get("name") for i in ideas])
+        logger.warning("  eval names = %s", [e.get("idea_name") or e.get("name") for e in evaluations])
+        # EMERGENCY: if we have ideas and evaluations, review ALL ideas
+        if ideas:
+            logger.info("EMERGENCY: reviewing ALL %d ideas since filtering failed", len(ideas))
+            for idea in ideas:
+                ideas_for_review.append({
+                    "name": idea.get("name", "unknown"),
+                    "category": idea.get("category", "unknown"),
+                    "description": idea.get("description") or idea.get("solution", ""),
+                    "target_audience": idea.get("target_audience") or idea.get("audience", ""),
+                    "monetization": idea.get("monetization", ""),
+                })
+        if not ideas_for_review:
+            return {
+                **state,
+                "reviews": [],
+                "status": "skipped_no_ideas",
+            }
 
     user_message = f"""Review the following {len(ideas_for_review)} product ideas that passed research evaluation.
 
