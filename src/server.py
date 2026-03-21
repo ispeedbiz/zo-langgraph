@@ -19,7 +19,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.5.3",
+    version="2.5.4",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +60,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.5.3",
+        "version": "2.5.4",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -329,12 +329,18 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
             state_ethics = await classify_tiers(state_ethics)
 
     # Store raw ethics response for debugging
+    raw_val = state_ethics.get("reviews_raw")
     _last_pipeline_result["ethics_debug"] = {
         "status": ethics_status,
         "reviews_count": len(ethics_reviews),
         "approved_count": len(state_ethics.get("approved", [])),
         "reviews_preview": [{"name": r.get("name"), "verdict": r.get("verdict"), "ethical_score": r.get("ethical_score")} for r in ethics_reviews[:5]],
-        "raw_preview": (state_ethics.get("reviews_raw") or "")[:500],
+        "raw_preview": str(raw_val)[:500] if raw_val else "(empty)",
+        "raw_type": str(type(raw_val)),
+        "raw_length": state_ethics.get("reviews_raw_length", -99),
+        "ideas_for_review_count": state_ethics.get("ideas_for_review_count", -99),
+        "ethics_error": state_ethics.get("error"),
+        "all_state_keys": list(state_ethics.keys()),
     }
 
     auto_approved_list = state_ethics.get("auto_approved", [])

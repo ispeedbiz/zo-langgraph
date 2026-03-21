@@ -449,8 +449,12 @@ IDEAS FOR ETHICAL REVIEW:
     )
 
     state = accumulate_cost(state, response)
-    state["reviews_raw"] = response["content"]
+    raw_content = response.get("content", "")
+    state["reviews_raw"] = raw_content
+    state["reviews_raw_length"] = len(raw_content) if isinstance(raw_content, str) else -1
+    state["ideas_for_review_count"] = len(ideas_for_review)
     state["status"] = "reviews_complete"
+    logger.info("Ethics Claude returned %d chars of content", len(raw_content) if isinstance(raw_content, str) else -1)
 
     return state
 
