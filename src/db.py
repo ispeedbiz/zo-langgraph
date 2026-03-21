@@ -2,6 +2,7 @@
 Supabase client + helper functions for the event bus, state, and learnings.
 """
 
+import json
 import logging
 from datetime import datetime, timezone
 from typing import Any
@@ -196,31 +197,36 @@ async def get_config(key: str, default: str = "") -> str:
 
 
 async def create_project(project_id: str, idea_data: dict) -> dict:
-    """Create a new project record from approved idea data."""
+    """Create a new project record from approved idea data.
+
+    zo_projects columns: project_id, name, category, status,
+    research_score, approval, github_repo, netlify_site_id, netlify_url,
+    subdomain, custom_domain, stripe_product_id, supabase_schema,
+    created_at, launched_at, sunset_at, monthly_users, mrr, metadata
+    """
     client = get_client()
     row = {
         "project_id": project_id,
-        "product_name": idea_data.get("name", ""),
         "name": idea_data.get("name", ""),
         "category": idea_data.get("category", ""),
         "status": idea_data.get("status", "approved"),
-        "product_tier": idea_data.get("tier") or idea_data.get("product_tier", 3),
+        "research_score": idea_data.get("ethical_score") or idea_data.get("weighted_score"),
+        "approval": idea_data.get("approval_method", "AUTONOMOUS"),
+        "metadata": json.dumps({
+            "tier": idea_data.get("tier") or idea_data.get("product_tier"),
+            "description": idea_data.get("description") or idea_data.get("solution", ""),
+            "target_audience": idea_data.get("target_audience") or idea_data.get("audience", ""),
+            "concerns": idea_data.get("concerns", []),
+            "reasoning": idea_data.get("reasoning", ""),
+        }),
     }
     try:
         result = client.table("zo_projects").insert(row).execute()
         logger.info("Created project %s: %s", project_id, result.data)
         return result.data[0] if result.data else {}
     except Exception as e:
-        logger.error("Failed to create project %s: %s (row: %s)", project_id, e, row)
-        # Try with 'id' instead of 'project_id' (different schema versions)
-        try:
-            row["id"] = row.pop("project_id")
-            result = client.table("zo_projects").insert(row).execute()
-            logger.info("Created project (id variant) %s: %s", project_id, result.data)
-            return result.data[0] if result.data else {}
-        except Exception as e2:
-            logger.error("Both insert variants failed for %s: %s", project_id, e2)
-            return {}
+        logger.error("Failed to create project %s: %s (row keys: %s)", project_id, e, list(row.keys()))
+        return {}
 
 
 async def get_project(project_id: str) -> dict | None:
