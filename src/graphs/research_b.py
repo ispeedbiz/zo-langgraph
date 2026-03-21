@@ -387,13 +387,40 @@ async def parse_evaluations(state: ResearchState) -> ResearchState:
     raw_text = state.get("research_text", "")
     parsed = extract_json(raw_text)
 
-    if not parsed or not isinstance(parsed, dict):
-        logger.error("Failed to parse Research B JSON output")
+    if not parsed:
+        logger.error("Failed to parse Research B JSON output from %d chars", len(raw_text))
+        logger.error("Raw text preview: %.300s", raw_text[:300])
         state["error"] = "JSON parse failed on evaluation response"
         state["status"] = "failed"
         return state
 
-    evaluations = parsed.get("evaluations", [])
+    # Handle both {"evaluations": [...]} and bare [...]
+    if isinstance(parsed, list):
+        evaluations = parsed
+        logger.info("Parsed %d evaluations from bare JSON array", len(evaluations))
+    elif isinstance(parsed, dict):
+        evaluations = parsed.get("evaluations", parsed.get("ideas", []))
+        if not evaluations and len(parsed) > 0:
+            # Maybe the dict IS a single evaluation
+            if "name" in parsed or "idea_name" in parsed:
+                evaluations = [parsed]
+            else:
+                # Try any list value in the dict
+                for v in parsed.values():
+                    if isinstance(v, list) and v and isinstance(v[0], dict):
+                        evaluations = v
+                        break
+        logger.info("Parsed %d evaluations from JSON object", len(evaluations))
+    else:
+        evaluations = []
+
+    if not evaluations:
+        logger.error("No evaluations found in parsed JSON. Keys: %s",
+                     list(parsed.keys()) if isinstance(parsed, dict) else type(parsed).__name__)
+        state["error"] = "No evaluations array found in Research B response"
+        state["status"] = "failed"
+        return state
+
     state["evaluations"] = evaluations
 
     # Recompute weighted scores server-side for integrity
@@ -401,20 +428,50 @@ async def parse_evaluations(state: ResearchState) -> ResearchState:
     go_evaluations = []
 
     for ev in evaluations:
+        # Handle different score structures:
+        # Option A: {"scores": {"market_demand": 8, ...}}
+        # Option B: {"market_demand": 8, ...} (flat)
+        # Option C: {"dimensions": {"market_demand": {...}}} (nested with reasoning)
         scores = ev.get("scores", {})
+        if not scores:
+            # Try flat scores
+            scores = {dim: ev.get(dim, 0) for dim in DIMENSION_WEIGHTS}
+        if not any(scores.values()):
+            # Try dimensions object
+            dims = ev.get("dimensions", {})
+            scores = {dim: dims.get(dim, {}).get("score", 0) if isinstance(dims.get(dim), dict) else dims.get(dim, 0)
+                      for dim in DIMENSION_WEIGHTS}
 
         # Calculate weighted score from raw dimensions
         weighted_sum = 0.0
+        has_scores = False
         for dim, weight in DIMENSION_WEIGHTS.items():
-            weighted_sum += scores.get(dim, 0) * weight
-        computed_score = round(weighted_sum / TOTAL_WEIGHT, 2)
+            val = scores.get(dim, 0)
+            if isinstance(val, (int, float)) and val > 0:
+                has_scores = True
+            weighted_sum += (val if isinstance(val, (int, float)) else 0) * weight
 
-        # Override Claude's score with our server-side calculation
+        if has_scores:
+            computed_score = round(weighted_sum / TOTAL_WEIGHT, 2)
+        else:
+            # Fall back to Claude's own weighted_score if we can't compute
+            computed_score = ev.get("weighted_score", ev.get("weighted_average", 0))
+            if isinstance(computed_score, str):
+                try:
+                    computed_score = float(computed_score)
+                except ValueError:
+                    computed_score = 0
+            logger.warning("Using Claude's weighted_score for '%s': %.2f (no parseable dimension scores)",
+                           ev.get("name", "?"), computed_score)
+
         ev["weighted_score"] = computed_score
         ev["decision"] = "GO" if computed_score >= GO_THRESHOLD else "NO-GO"
 
+        # Get idea name — handle both "idea_name" and "name"
+        idea_name = ev.get("idea_name") or ev.get("name") or "unknown"
+
         if computed_score >= GO_THRESHOLD:
-            go_ideas.append(ev.get("idea_name", "unknown"))
+            go_ideas.append(idea_name)
             go_evaluations.append(ev)
 
     state["go_ideas"] = go_ideas
@@ -422,8 +479,8 @@ async def parse_evaluations(state: ResearchState) -> ResearchState:
     state["status"] = "parsed"
 
     logger.info(
-        "Research B: %d/%d ideas passed GO threshold (>= %.1f)",
-        len(go_ideas), len(evaluations), GO_THRESHOLD,
+        "Research B: %d/%d ideas passed GO threshold (>= %.1f). GO: %s",
+        len(go_ideas), len(evaluations), GO_THRESHOLD, go_ideas,
     )
 
     return state
