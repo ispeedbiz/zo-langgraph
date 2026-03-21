@@ -8,6 +8,7 @@ v2.1 — Graphs wired. Every handler executes real LangGraph agents.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Any
@@ -18,10 +19,14 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.3.0",
+    version="2.4.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
+
+# ── Diagnostic State ───────────────────────────────────
+_last_pipeline_error: dict = {}
+_last_pipeline_result: dict = {}
 
 # ── Request Models ──────────────────────────────────────
 
@@ -55,9 +60,18 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.3.0",
+        "version": "2.4.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
+    }
+
+
+@app.get("/debug/last-error")
+async def debug_last_error():
+    """Show the last pipeline error with full traceback."""
+    return {
+        "last_error": _last_pipeline_error,
+        "last_result": _last_pipeline_result,
     }
 
 
@@ -101,12 +115,21 @@ async def process_event(req: PipelineEventRequest, background_tasks: BackgroundT
 
 async def _run_handler_safe(handler, project_id, payload, event_id):
     """Run a handler with error catching — never crash the server."""
+    import traceback as tb_module
     try:
         result = await handler(project_id, payload)
+        _last_pipeline_result.update({"result": result, "timestamp": str(datetime.now(timezone.utc))})
         await db.mark_event_processed(event_id)
         logger.info(f"Handler completed: {result}")
     except Exception as e:
-        logger.error(f"Handler failed: {e}", exc_info=True)
+        error_tb = tb_module.format_exc()
+        logger.error(f"Handler FAILED: {e}\n{error_tb}")
+        _last_pipeline_error.update({
+            "stage": "handler_exception",
+            "error": str(e),
+            "traceback": error_tb,
+            "timestamp": str(datetime.now(timezone.utc)),
+        })
         await db.mark_event_processed(event_id, error=str(e))
 
 
@@ -218,23 +241,37 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
         if state_b.get("error"):
             return {"status": "failed", "stage": "research_b", "error": state_b["error"]}
 
-    go_ideas = state_b.get("go_ideas", [])
-    go_evaluations = state_b.get("go_evaluations", state_b.get("evaluations", []))
-    logger.info("Research Mind B complete: %d GO ideas out of %d evaluated", len(go_ideas), len(ideas))
-
-    if not go_ideas:
-        # Don't give up — if we have evaluations, compute GO ideas from scores
-        all_evals = state_b.get("evaluations", [])
-        if all_evals:
-            logger.info("No go_ideas but %d evaluations exist — recomputing", len(all_evals))
-            go_ideas = [e.get("idea_name") or e.get("name") for e in all_evals
-                        if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
-            go_evaluations = [e for e in all_evals if (e.get("idea_name") or e.get("name")) in go_ideas]
-            logger.info("Recomputed: %d GO ideas", len(go_ideas))
+    # === B→Ethics transition (wrapped in try/except for full traceback) ===
+    try:
+        go_ideas = state_b.get("go_ideas", [])
+        go_evaluations = state_b.get("go_evaluations", state_b.get("evaluations", []))
+        logger.info("Research Mind B complete: %d GO ideas out of %d evaluated", len(go_ideas), len(ideas))
 
         if not go_ideas:
-            logger.warning("Research Mind B found 0 GO ideas — stopping pipeline")
-            return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
+            # Don't give up — if we have evaluations, compute GO ideas from scores
+            all_evals = state_b.get("evaluations", [])
+            if all_evals:
+                logger.info("No go_ideas but %d evaluations exist — recomputing", len(all_evals))
+                go_ideas = [e.get("idea_name") or e.get("name") for e in all_evals
+                            if (e.get("weighted_score") or e.get("weighted_average") or 0) >= 7.0]
+                go_evaluations = [e for e in all_evals if (e.get("idea_name") or e.get("name")) in go_ideas]
+                logger.info("Recomputed: %d GO ideas", len(go_ideas))
+
+            if not go_ideas:
+                logger.warning("Research Mind B found 0 GO ideas — stopping pipeline")
+                return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
+
+        logger.info("B→Ethics handoff: %d GO ideas, %d evaluations, %d original ideas",
+                     len(go_ideas), len(go_evaluations), len(ideas))
+
+    except Exception as e:
+        import traceback
+        logger.error("B→Ethics TRANSITION CRASHED: %s\n%s", e, traceback.format_exc())
+        # Store the error for diagnostic endpoint
+        _last_pipeline_error["stage"] = "b_to_ethics_transition"
+        _last_pipeline_error["error"] = str(e)
+        _last_pipeline_error["traceback"] = traceback.format_exc()
+        return {"status": "failed", "stage": "b_to_ethics_transition", "error": str(e)}
 
     # Step 3: Ethics Mind — approve/block
     logger.info("═══ PIPELINE STEP 3/3: Ethics Mind starting (%d GO ideas) ═══", len(go_ideas))
@@ -245,7 +282,11 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
             go_ideas=go_ideas,
         )
     except Exception as e:
-        logger.error("Ethics Mind CRASHED: %s", e, exc_info=True)
+        import traceback
+        logger.error("Ethics Mind CRASHED: %s\n%s", e, traceback.format_exc())
+        _last_pipeline_error["stage"] = "ethics"
+        _last_pipeline_error["error"] = str(e)
+        _last_pipeline_error["traceback"] = traceback.format_exc()
         return {"status": "failed", "stage": "ethics", "error": str(e)}
 
     auto_approved = len(state_ethics.get("auto_approved", []))
