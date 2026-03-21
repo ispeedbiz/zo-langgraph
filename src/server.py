@@ -115,46 +115,80 @@ async def _run_handler_safe(handler, project_id, payload, event_id):
 
 async def _handle_research_trigger(project_id: str | None, payload: dict) -> dict:
     """Start the full research pipeline: Agent A → Agent B → Ethics."""
+
     # Step 1: Research Mind A — generate ideas
-    state_a = await run_research_a(config_overrides=payload)
+    logger.info("═══ PIPELINE STEP 1/3: Research Mind A starting ═══")
+    try:
+        state_a = await run_research_a(config_overrides=payload)
+    except Exception as e:
+        logger.error("Research Mind A CRASHED: %s", e, exc_info=True)
+        return {"status": "failed", "stage": "research_a", "error": str(e)}
 
     if state_a.get("error"):
+        logger.error("Research Mind A returned error: %s", state_a["error"])
         return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
 
-    # Step 2: Research Mind B — evaluate ideas
     ideas = state_a.get("ideas", [])
+    logger.info("Research Mind A complete: %d ideas generated", len(ideas))
+
     if not ideas:
+        logger.warning("Research Mind A produced 0 ideas — stopping pipeline")
         return {"status": "completed", "stage": "research_a", "result": "no_ideas_generated"}
 
-    state_b = await run_research_b(ideas=ideas, batch_id=state_a.get("batch_id", ""))
+    # Step 2: Research Mind B — evaluate ideas
+    logger.info("═══ PIPELINE STEP 2/3: Research Mind B starting (%d ideas) ═══", len(ideas))
+    try:
+        state_b = await run_research_b(ideas=ideas, batch_id=state_a.get("batch_id", ""))
+    except Exception as e:
+        logger.error("Research Mind B CRASHED: %s", e, exc_info=True)
+        return {"status": "failed", "stage": "research_b", "error": str(e)}
 
     if state_b.get("error"):
+        logger.error("Research Mind B returned error: %s", state_b["error"])
         return {"status": "failed", "stage": "research_b", "error": state_b["error"]}
 
-    # Step 3: Ethics Mind — approve/block
     go_ideas = state_b.get("go_ideas", [])
     go_evaluations = state_b.get("go_evaluations", state_b.get("evaluations", []))
+    logger.info("Research Mind B complete: %d GO ideas out of %d", len(go_ideas), len(ideas))
+
     if not go_ideas:
+        logger.warning("Research Mind B found 0 GO ideas — stopping pipeline")
         return {"status": "completed", "stage": "research_b", "result": "no_go_ideas"}
 
-    state_ethics = await run_ethics(
-        ideas=ideas,
-        evaluations=go_evaluations,
-        go_ideas=go_ideas,
+    # Step 3: Ethics Mind — approve/block
+    logger.info("═══ PIPELINE STEP 3/3: Ethics Mind starting (%d GO ideas) ═══", len(go_ideas))
+    try:
+        state_ethics = await run_ethics(
+            ideas=ideas,
+            evaluations=go_evaluations,
+            go_ideas=go_ideas,
+        )
+    except Exception as e:
+        logger.error("Ethics Mind CRASHED: %s", e, exc_info=True)
+        return {"status": "failed", "stage": "ethics", "error": str(e)}
+
+    auto_approved = len(state_ethics.get("auto_approved", []))
+    pending = len(state_ethics.get("pending_approval", []))
+    blocked = len(state_ethics.get("blocked", []))
+    total_cost = round(
+        state_a.get("total_cost_usd", 0) +
+        state_b.get("total_cost_usd", 0) +
+        state_ethics.get("total_cost_usd", 0), 4
+    )
+
+    logger.info(
+        "═══ PIPELINE COMPLETE: %d auto-approved, %d pending, %d blocked, cost $%.4f ═══",
+        auto_approved, pending, blocked, total_cost,
     )
 
     return {
         "status": "completed",
         "ideas_generated": len(ideas),
         "go_ideas": len(go_ideas),
-        "auto_approved": len(state_ethics.get("auto_approved", [])),
-        "pending_approval": len(state_ethics.get("pending_approval", [])),
-        "blocked": len(state_ethics.get("blocked", [])),
-        "total_cost_usd": round(
-            state_a.get("total_cost_usd", 0) +
-            state_b.get("total_cost_usd", 0) +
-            state_ethics.get("total_cost_usd", 0), 4
-        ),
+        "auto_approved": auto_approved,
+        "pending_approval": pending,
+        "blocked": blocked,
+        "total_cost_usd": total_cost,
     }
 
 

@@ -7,16 +7,20 @@ Claude API wrapper with:
 """
 
 import anthropic
+import asyncio
+import logging
 from typing import Any
 from .config import config, AGENT_MODEL_MAP
 from . import db
+
+logger = logging.getLogger("zo.claude")
 
 
 class ClaudeClient:
     """Tiered, cost-tracked Claude API client."""
 
     def __init__(self):
-        self.client = anthropic.Anthropic(api_key=config.anthropic_api_key)
+        self.client = anthropic.AsyncAnthropic(api_key=config.anthropic_api_key)
 
     async def call(
         self,
@@ -68,8 +72,9 @@ class ClaudeClient:
                 "text": extra_context,
             })
 
-        # Make the API call
-        response = self.client.messages.create(
+        # Make the API call (async — does NOT block the event loop)
+        logger.info("Calling %s (model=%s, tier=%s)", agent_name, model, tier)
+        response = await self.client.messages.create(
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
