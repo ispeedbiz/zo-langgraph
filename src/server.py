@@ -124,15 +124,49 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
         logger.error("Research Mind A CRASHED: %s", e, exc_info=True)
         return {"status": "failed", "stage": "research_a", "error": str(e)}
 
+    # Log FULL state for debugging (what keys exist, what status)
+    logger.info(
+        "Research Mind A state: status=%s, error=%s, keys=%s, ideas_count=%d, text_len=%d",
+        state_a.get("status"), state_a.get("error"),
+        list(state_a.keys()),
+        len(state_a.get("ideas", [])),
+        len(state_a.get("research_text", "")),
+    )
+
     if state_a.get("error"):
         logger.error("Research Mind A returned error: %s", state_a["error"])
-        return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
+        # DON'T stop here if we have ideas despite the error — parser might have
+        # set error but ideas were extracted anyway
+        if not state_a.get("ideas"):
+            # Try emergency JSON extraction from research_text
+            raw = state_a.get("research_text", "")
+            if raw:
+                logger.info("Attempting emergency JSON extraction (%d chars)", len(raw))
+                from .graphs.shared import extract_json
+                parsed = extract_json(raw)
+                if parsed:
+                    ideas_emergency = parsed if isinstance(parsed, list) else parsed.get("ideas", [])
+                    if ideas_emergency:
+                        logger.info("Emergency extraction found %d ideas!", len(ideas_emergency))
+                        state_a["ideas"] = ideas_emergency
+                        state_a["error"] = None  # Clear error since we recovered
+                    else:
+                        logger.error("Emergency extraction got JSON but no ideas list")
+                        return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
+                else:
+                    logger.error("Emergency extraction failed — no JSON in %d chars of text", len(raw))
+                    # Log first 500 chars so we can see what Claude returned
+                    logger.error("Research text preview: %.500s", raw[:500])
+                    return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
+            else:
+                return {"status": "failed", "stage": "research_a", "error": state_a["error"]}
 
     ideas = state_a.get("ideas", [])
     logger.info("Research Mind A complete: %d ideas generated", len(ideas))
 
     if not ideas:
         logger.warning("Research Mind A produced 0 ideas — stopping pipeline")
+        logger.warning("State dump: %s", {k: type(v).__name__ for k, v in state_a.items()})
         return {"status": "completed", "stage": "research_a", "result": "no_ideas_generated"}
 
     # Step 2: Research Mind B — evaluate ideas

@@ -127,16 +127,48 @@ class MarketingState(TypedDict, total=False):
 # ── JSON Extraction Utilities ─────────────────────────────
 
 def extract_json(text: str) -> dict | list | None:
-    """Extract JSON from Claude's response, handling code blocks and raw JSON."""
-    # Method 1: Code block
+    """Extract JSON from Claude's response, handling code blocks, multi-block
+    web search responses, and raw JSON.  Tries multiple strategies."""
+
+    if not text or not text.strip():
+        logger.warning("extract_json: empty input text")
+        return None
+
+    # Method 1: Code block (most reliable — Claude wraps JSON here)
     code_match = re.search(r'```json?\s*([\s\S]*?)```', text)
     if code_match:
         try:
             return json.loads(code_match.group(1))
-        except json.JSONDecodeError:
-            pass
+        except json.JSONDecodeError as e:
+            logger.warning("extract_json: code block found but invalid JSON: %s", e)
 
-    # Method 2: Raw JSON object
+    # Method 2: Find a JSON array containing objects with "name" field
+    # This is specific to idea/evaluation arrays — the most common case
+    arr_matches = re.finditer(r'\[[\s\S]*?\]', text)
+    for match in arr_matches:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
+                if "name" in parsed[0]:  # Looks like an ideas array
+                    logger.info("extract_json: found ideas array with %d items", len(parsed))
+                    return parsed
+        except json.JSONDecodeError:
+            continue
+
+    # Method 3: Find JSON object with "ideas" key
+    obj_matches = re.finditer(r'\{[\s\S]*?\}', text)
+    for match in obj_matches:
+        candidate = match.group(0)
+        if '"ideas"' in candidate or '"evaluations"' in candidate or '"reviews"' in candidate:
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    logger.info("extract_json: found JSON object with keys %s", list(parsed.keys())[:5])
+                    return parsed
+            except json.JSONDecodeError:
+                continue
+
+    # Method 4: Greedy — largest JSON object in the text
     obj_match = re.search(r'\{[\s\S]*\}', text)
     if obj_match:
         try:
@@ -144,7 +176,7 @@ def extract_json(text: str) -> dict | list | None:
         except json.JSONDecodeError:
             pass
 
-    # Method 3: Raw JSON array
+    # Method 5: Greedy — largest JSON array
     arr_match = re.search(r'\[[\s\S]*\]', text)
     if arr_match:
         try:
@@ -152,6 +184,7 @@ def extract_json(text: str) -> dict | list | None:
         except json.JSONDecodeError:
             pass
 
+    logger.error("extract_json: ALL methods failed on %d chars. Preview: %.200s", len(text), text[:200])
     return None
 
 
