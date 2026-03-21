@@ -39,6 +39,9 @@ class EthicsState(TypedDict, total=False):
     ideas: list[dict]
     evaluations: list[dict]
     reviews: list[dict]
+    reviews_raw: str  # Raw Claude response text — MUST be in TypedDict or LangGraph drops it
+    reviews_raw_length: int
+    ideas_for_review_count: int
     approved: list[dict]
     blocked: list[dict]
     needs_fixes: list[dict]
