@@ -19,6 +19,27 @@ from .shared import MarketingState, extract_json, accumulate_cost, OUTPUT_JSON_I
 logger = logging.getLogger("zo.marketing")
 
 
+# ── Voice Check Filters ──────────────────────────────────────────────────
+#
+# Before publishing ANY customer-facing content, run it through these 5 filters:
+#
+# 1. The Jagdish Filter: Would Jagdish put his name on this?
+#    Does it reflect his values of honesty, depth, and practical value?
+#
+# 2. The Advik Filter: Could a 10-year-old understand the value prop?
+#
+# 3. The Zero Filter: Is every word earning its place?
+#    Have we stripped away everything unnecessary?
+#
+# 4. The Constitution Filter: No dark patterns, no fake social proof,
+#    no exploitation of cognitive biases (Article III compliance).
+#
+# 5. The Silence Filter: Is the world worse off if we say nothing?
+#    Only publish if the answer is yes.
+#
+# ─────────────────────────────────────────────────────────────────────────
+
+
 # ── System Prompts ───────────────────────────────────────────────────────
 
 MARKETING_SYSTEM_PROMPT = """You are the Marketing Mind of ZeroOrigine — the Storyteller.
@@ -69,6 +90,28 @@ GANDHI — Authenticity Rule (CRITICAL)
   These drafts provide structure and talking points, but the human voice
   must be the one that speaks in communities built on trust.
   The Salt March worked because Gandhi walked it himself.
+
+ZERORIGINE BRAND VOICE (v2):
+  ZeroOrigine speaks like a quiet builder who has already done the work —
+  never selling, always showing.
+
+  Rule: Lead with the problem, not the product. Every piece of content must
+  start with the human struggle. The product is the answer, never the opening line.
+
+  Rule: Community posts are always DRAFTS marked [DRAFT — FOUNDER REVIEWS BEFORE POSTING].
+  Authenticity cannot be automated. The founder posts these manually.
+
+  Rule: 80/20 — 4 value posts for every 1 product post. Value posts teach,
+  inspire, or provoke thought. Product posts are framed as "here's what we built
+  and why" — never "buy this."
+
+VOCABULARY TO USE:
+  focused, useful, honest, simple, built, saves you [specific time],
+  your data, free tier
+
+VOCABULARY TO AVOID (never use these words):
+  revolutionary, disrupt, leverage, game-changer, hack, guru, synergy,
+  best-in-class
 
 CONSTRAINTS:
 - Never use manipulative urgency ("Limited time!", "Act now!")
@@ -438,8 +481,8 @@ async def emit_result(state: MarketingState) -> MarketingState:
             "total_tokens": state.get("total_tokens", 0),
             "total_cost_usd": state.get("total_cost_usd", 0),
             "community_posts_reminder": (
-                "FOUNDER ACTION REQUIRED: Community post drafts need human review "
-                "before posting. Gandhi authenticity rule — you must walk the Salt March yourself."
+                "All community posts are DRAFTS only. Founder must review before "
+                "posting. Gandhi authenticity rule."
             ),
         },
     )

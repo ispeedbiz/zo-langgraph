@@ -264,6 +264,21 @@ async def emit_result(state: ResearchState) -> ResearchState:
         cost=state.get("total_cost_usd", 0),
     )
 
+    # ── Truncate evaluations for the event payload ──────────
+    # Full data is already saved in the checkpoint above (agent_state
+    # table, no size limit).  The pipeline_events.payload column has a
+    # hard size cap, so we emit only the summary fields.
+    _SUMMARY_KEYS = (
+        "name", "weighted_score", "product_tier",
+        "estimated_build_cost_cad", "revenue_confidence", "verdict",
+    )
+
+    def _summarise(evals: list[dict]) -> list[dict]:
+        return [
+            {k: e[k] for k in _SUMMARY_KEYS if k in e}
+            for e in (evals or [])
+        ]
+
     # Emit event for n8n / Ethics Mind to pick up
     await db.emit_event(
         event_type="evaluation_complete",
@@ -273,8 +288,8 @@ async def emit_result(state: ResearchState) -> ResearchState:
             "total_ideas": len(evaluations),
             "go_count": len(go_ideas),
             "go_ideas": go_ideas,
-            "go_evaluations": go_evaluations,
-            "all_evaluations": evaluations,
+            "go_evaluations": _summarise(go_evaluations),
+            "all_evaluations": _summarise(evaluations),
             "total_tokens": state.get("total_tokens", 0),
             "total_cost_usd": state.get("total_cost_usd", 0),
         },

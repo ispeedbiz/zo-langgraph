@@ -73,8 +73,7 @@ Respond with a JSON block containing a "reviews" array:
 {
   "reviews": [
     {
-      "idea_id": "the idea's id",
-      "name": "product name",
+      "name": "product name (must match the input name exactly)",
       "verdict": "APPROVED | NEEDS_FIXES | BLOCKED",
       "ethical_score": 8.5,
       "scores": {
@@ -106,22 +105,21 @@ async def review_ethics(state: EthicsState) -> EthicsState:
 
     # Build the user message with idea details and their evaluations
     ideas_for_review = []
-    go_ids = {e.get("idea_id") for e in evaluations if e.get("verdict") == "GO"}
+    go_names = {e.get("idea_name") or e.get("name") for e in evaluations if e.get("verdict") == "GO"}
 
     for idea in ideas:
-        idea_id = idea.get("id") or idea.get("idea_id")
-        if idea_id not in go_ids:
+        idea_name = idea.get("name", "")
+        if idea_name not in go_names:
             continue
 
-        # Find matching evaluation
+        # Find matching evaluation by name
         eval_data = next(
-            (e for e in evaluations if e.get("idea_id") == idea_id),
+            (e for e in evaluations if (e.get("idea_name") or e.get("name")) == idea_name),
             {},
         )
 
         ideas_for_review.append({
-            "idea_id": idea_id,
-            "name": idea.get("name", "Unnamed"),
+            "name": idea_name,
             "category": idea.get("category", "unknown"),
             "description": idea.get("description", ""),
             "target_audience": idea.get("target_audience", ""),
@@ -205,7 +203,7 @@ async def parse_reviews(state: EthicsState) -> EthicsState:
         elif verdict == "NEEDS_FIXES":
             needs_fixes.append(review)
         else:
-            logger.warning(f"Unknown verdict '{verdict}' for idea {review.get('idea_id')}, treating as NEEDS_FIXES")
+            logger.warning(f"Unknown verdict '{verdict}' for idea {review.get('name')}, treating as NEEDS_FIXES")
             review["verdict"] = "NEEDS_FIXES"
             needs_fixes.append(review)
 
@@ -234,20 +232,20 @@ async def classify_tiers(state: EthicsState) -> EthicsState:
     approved = state.get("approved", [])
     evaluations = state.get("evaluations", [])
 
-    # Build a lookup: idea_id → evaluation data
+    # Build a lookup: name → evaluation data
     eval_lookup = {}
     for e in evaluations:
-        eid = e.get("idea_id")
-        if eid:
-            eval_lookup[eid] = e
+        ename = e.get("idea_name") or e.get("name")
+        if ename:
+            eval_lookup[ename] = e
 
     auto_approved = []
     pending_approval = []
 
     for review in approved:
-        idea_id = review.get("idea_id")
+        idea_name = review.get("name")
         ethical_score = review.get("ethical_score", 0)
-        eval_data = eval_lookup.get(idea_id, {})
+        eval_data = eval_lookup.get(idea_name, {})
         tier = eval_data.get("tier", 99)
 
         # Parse tier if it's a string like "Tier 1" or "1"
@@ -303,7 +301,6 @@ async def emit_results(state: EthicsState) -> EthicsState:
             project_id=project_id,
             source_agent="ethics",
             payload={
-                "idea_id": idea.get("idea_id"),
                 "name": idea.get("name"),
                 "ethical_score": idea.get("ethical_score"),
                 "tier": idea.get("tier"),
@@ -320,7 +317,6 @@ async def emit_results(state: EthicsState) -> EthicsState:
             project_id=project_id,
             source_agent="ethics",
             payload={
-                "idea_id": idea.get("idea_id"),
                 "name": idea.get("name"),
                 "ethical_score": idea.get("ethical_score"),
                 "tier": idea.get("tier"),
@@ -339,7 +335,6 @@ async def emit_results(state: EthicsState) -> EthicsState:
             project_id=project_id,
             source_agent="ethics",
             payload={
-                "idea_id": idea.get("idea_id"),
                 "name": idea.get("name"),
                 "ethical_score": idea.get("ethical_score"),
                 "verdict": "BLOCKED",
@@ -356,7 +351,6 @@ async def emit_results(state: EthicsState) -> EthicsState:
             project_id=project_id,
             source_agent="ethics",
             payload={
-                "idea_id": idea.get("idea_id"),
                 "name": idea.get("name"),
                 "ethical_score": idea.get("ethical_score"),
                 "verdict": "NEEDS_FIXES",
@@ -374,7 +368,6 @@ async def emit_results(state: EthicsState) -> EthicsState:
         for review in all_reviews:
             rows.append({
                 "project_id": project_id,
-                "idea_id": review.get("idea_id"),
                 "name": review.get("name"),
                 "verdict": review.get("verdict"),
                 "ethical_score": review.get("ethical_score"),
@@ -388,7 +381,7 @@ async def emit_results(state: EthicsState) -> EthicsState:
 
         try:
             client.table("ethics_reviews").upsert(
-                rows, on_conflict="project_id,idea_id"
+                rows, on_conflict="project_id,name"
             ).execute()
             logger.info(f"Stored {len(rows)} ethics reviews in Supabase")
         except Exception as e:
@@ -401,10 +394,10 @@ async def emit_results(state: EthicsState) -> EthicsState:
         node_name="emit_results",
         step_number=4,
         state_data={
-            "auto_approved": [r.get("idea_id") for r in auto_approved],
-            "pending_approval": [r.get("idea_id") for r in pending_approval],
-            "blocked": [r.get("idea_id") for r in blocked],
-            "needs_fixes": [r.get("idea_id") for r in needs_fixes],
+            "auto_approved": [r.get("name") for r in auto_approved],
+            "pending_approval": [r.get("name") for r in pending_approval],
+            "blocked": [r.get("name") for r in blocked],
+            "needs_fixes": [r.get("name") for r in needs_fixes],
             "total_reviews": len(all_reviews),
         },
         tokens=state.get("total_tokens", 0),
@@ -454,17 +447,18 @@ async def run_ethics(
     Args:
         ideas: Raw idea dicts from Research Mind A.
         evaluations: Evaluation dicts from Research Mind B (with verdicts, tiers).
-        go_ideas: List of idea IDs that passed Research Mind B with GO verdict.
+        go_ideas: List of idea names that passed Research Mind B with GO verdict.
         project_id: Optional project ID for cost attribution and event tracking.
 
     Returns:
         Final EthicsState with approved, blocked, needs_fixes, auto_approved,
         and pending_approval lists populated.
     """
-    # Filter evaluations to only GO ideas
+    # Filter evaluations to only GO ideas (match by name, not id)
+    go_names_set = set(go_ideas)
     go_evaluations = [
         e for e in evaluations
-        if e.get("idea_id") in set(go_ideas) or e.get("verdict") == "GO"
+        if (e.get("idea_name") or e.get("name")) in go_names_set or e.get("verdict") == "GO"
     ]
 
     initial_state: EthicsState = {
