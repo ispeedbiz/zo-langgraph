@@ -19,7 +19,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.4.0",
+    version="2.5.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +60,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.4.0",
+        "version": "2.5.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -289,27 +289,54 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
         _last_pipeline_error["traceback"] = traceback.format_exc()
         return {"status": "failed", "stage": "ethics", "error": str(e)}
 
-    auto_approved = len(state_ethics.get("auto_approved", []))
-    pending = len(state_ethics.get("pending_approval", []))
-    blocked = len(state_ethics.get("blocked", []))
+    auto_approved_list = state_ethics.get("auto_approved", [])
+    pending_list = state_ethics.get("pending_approval", [])
+    blocked_list = state_ethics.get("blocked", [])
     total_cost = round(
         state_a.get("total_cost_usd", 0) +
         state_b.get("total_cost_usd", 0) +
         state_ethics.get("total_cost_usd", 0), 4
     )
 
+    # === Create project records for approved ideas ===
+    for idea in auto_approved_list:
+        idea_name = idea.get("name", "unknown")
+        project_id = f"zo-{idea_name.lower().replace(' ', '-').replace('/', '-')}"
+        try:
+            await db.create_project(project_id, {
+                **idea,
+                "status": "approved",
+                "approval_method": "AUTONOMOUS",
+            })
+            logger.info(f"Created project: {project_id} (auto-approved)")
+        except Exception as e:
+            logger.error(f"Failed to create project {project_id}: {e}")
+
+    for idea in pending_list:
+        idea_name = idea.get("name", "unknown")
+        project_id = f"zo-{idea_name.lower().replace(' ', '-').replace('/', '-')}"
+        try:
+            await db.create_project(project_id, {
+                **idea,
+                "status": "pending_approval",
+                "approval_method": "FOUNDER",
+            })
+            logger.info(f"Created project: {project_id} (pending approval)")
+        except Exception as e:
+            logger.error(f"Failed to create project {project_id}: {e}")
+
     logger.info(
         "═══ PIPELINE COMPLETE: %d auto-approved, %d pending, %d blocked, cost $%.4f ═══",
-        auto_approved, pending, blocked, total_cost,
+        len(auto_approved_list), len(pending_list), len(blocked_list), total_cost,
     )
 
     return {
         "status": "completed",
         "ideas_generated": len(ideas),
         "go_ideas": len(go_ideas),
-        "auto_approved": auto_approved,
-        "pending_approval": pending,
-        "blocked": blocked,
+        "auto_approved": len(auto_approved_list),
+        "pending_approval": len(pending_list),
+        "blocked": len(blocked_list),
         "total_cost_usd": total_cost,
     }
 

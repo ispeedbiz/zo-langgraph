@@ -467,15 +467,28 @@ async def parse_reviews(state: EthicsState) -> EthicsState:
     needs_fixes = []
 
     for review in reviews:
-        verdict = review.get("verdict", "").upper()
+        verdict = (review.get("verdict") or review.get("decision") or "").upper()
+        ethical_score = review.get("ethical_score") or review.get("score") or review.get("overall_score") or 0
+        # Normalize ethical_score to float
+        try:
+            ethical_score = float(ethical_score)
+        except (ValueError, TypeError):
+            ethical_score = 0
+        review["ethical_score"] = ethical_score
+
         if verdict == "APPROVED":
             approved.append(review)
         elif verdict == "BLOCKED":
             blocked.append(review)
-        elif verdict == "NEEDS_FIXES":
+        elif verdict in ("NEEDS_FIXES", "NEEDS FIXES"):
             needs_fixes.append(review)
+        elif ethical_score >= 7.0:
+            # High score but unclear verdict — treat as approved
+            logger.info(f"Idea '{review.get('name')}' has score {ethical_score} but verdict '{verdict}' — auto-approving")
+            review["verdict"] = "APPROVED"
+            approved.append(review)
         else:
-            logger.warning(f"Unknown verdict '{verdict}' for idea {review.get('name')}, treating as NEEDS_FIXES")
+            logger.warning(f"Unknown verdict '{verdict}' (score={ethical_score}) for {review.get('name')}, treating as NEEDS_FIXES")
             review["verdict"] = "NEEDS_FIXES"
             needs_fixes.append(review)
 
@@ -645,24 +658,23 @@ async def emit_results(state: EthicsState) -> EthicsState:
         for review in all_reviews:
             rows.append({
                 "project_id": project_id,
+                "idea_name": review.get("name"),
                 "name": review.get("name"),
-                "verdict": review.get("verdict"),
+                "verdict": (review.get("verdict") or "NEEDS_FIXES").upper(),
                 "ethical_score": review.get("ethical_score"),
-                "scores": review.get("scores", {}),
                 "concerns": review.get("concerns", []),
                 "required_fixes": review.get("required_fixes", []),
                 "reasoning": review.get("reasoning", ""),
-                "approval_method": review.get("approval_method"),
-                "status": review.get("status", review.get("verdict")),
+                "batch_id": state.get("project_id"),
             })
 
         try:
-            client.table("ethics_reviews").upsert(
-                rows, on_conflict="project_id,name"
-            ).execute()
+            # Use insert (not upsert) — avoids needing unique constraint
+            # If duplicate, Supabase will auto-assign new UUID primary key
+            client.table("ethics_reviews").insert(rows).execute()
             logger.info(f"Stored {len(rows)} ethics reviews in Supabase")
         except Exception as e:
-            logger.error(f"Failed to store ethics reviews: {e}")
+            logger.error(f"Failed to store ethics reviews: {e}", exc_info=True)
 
     # Save checkpoint
     await db.save_checkpoint(
