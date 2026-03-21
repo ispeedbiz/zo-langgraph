@@ -48,12 +48,16 @@ class ManualTriggerRequest(BaseModel):
 
 @app.get("/health")
 async def health():
+    try:
+        ecosystem_status = await db.get_config("ecosystem_status", "active")
+    except Exception:
+        ecosystem_status = "unknown (db unreachable)"
     return {
         "status": "ok",
         "service": "zo-langgraph",
         "version": "2.1.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
-        "ecosystem_status": await db.get_config("ecosystem_status", "active"),
+        "ecosystem_status": ecosystem_status,
     }
 
 
