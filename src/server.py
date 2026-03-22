@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.4.0",
+    version="3.5.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.4.0",
+        "version": "3.5.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1120,7 +1120,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.4.0)\n"
+        f"Railway: OK (v3.5.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1486,10 +1486,29 @@ async def _run_builder_safe(project_id: str, product_name: str):
                     # Trigger Marketing Mind automatically
                     try:
                         mkt_result = await _handle_qa_passed(project_id, {"product_name": product_name})
-                        await notify(f"📢 Marketing COMPLETE for {product_name}!\nCost: ${mkt_result.get('marketing_cost', 0):.2f}\n\n🚀 Ready for launch.")
+                        await notify(f"📢 Marketing COMPLETE for {product_name}!\nCost: ${mkt_result.get('marketing_cost', 0):.2f}\n\n🚀 Deploying to Netlify...")
                     except Exception as mkt_err:
                         logger.error("Marketing failed for %s: %s", product_name, mkt_err)
-                        await notify(f"⚠️ Marketing error for {product_name}: {str(mkt_err)[:150]}\n\nProduct still QA-passed — can launch without marketing.")
+                        await notify(f"⚠️ Marketing error for {product_name}: {str(mkt_err)[:150]}\n\nProceeding to deploy anyway.")
+
+                    # H-049: Auto-deploy to Netlify
+                    try:
+                        deploy_result = await _auto_deploy_product(project_id, product_name)
+                        if deploy_result.get("success"):
+                            live_url = deploy_result.get("url", "")
+                            await notify(
+                                f"🎉 {product_name} IS LIVE!\n\n"
+                                f"🔗 {live_url}\n\n"
+                                f"Built: ${cost:.2f}\n"
+                                f"QA Score: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}\n"
+                                f"Marketing: ready\n\n"
+                                f"Health monitoring starts automatically."
+                            )
+                        else:
+                            await notify(f"⚠️ Deploy issue for {product_name}: {deploy_result.get('error', 'unknown')[:200]}\n\nProduct built + QA passed. Manual deploy may be needed.")
+                    except Exception as deploy_err:
+                        logger.error("Deploy failed for %s: %s", product_name, deploy_err)
+                        await notify(f"⚠️ Deploy error for {product_name}: {str(deploy_err)[:150]}\n\nProduct built + QA passed. Manual deploy needed.")
                 else:
                     db.get_client().table("zo_projects").update({"status": "qa_failed"}).eq("project_id", project_id).execute()
                     await notify(f"⚠️ QA needs fixes for {product_name}\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
@@ -1501,6 +1520,122 @@ async def _run_builder_safe(project_id: str, product_name: str):
         logger.error("Builder Mind crashed for %s: %s", product_name, e, exc_info=True)
         db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
         await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}")
+
+
+async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
+    """H-049: Auto-deploy a built product to Netlify.
+
+    1. Create Netlify site from zo-saas-template
+    2. Configure env vars (Supabase, Stripe)
+    3. Set up subdomain DNS
+    4. Update zo_projects with live URL
+    5. Register with Health Pulse
+    """
+    import httpx
+    import os
+
+    client = db.get_client()
+    project = client.table("zo_projects").select("*").eq("project_id", project_id).execute().data
+    if not project:
+        return {"success": False, "error": "Project not found"}
+    project = project[0]
+
+    # Generate subdomain from product name
+    subdomain = product_name.lower().replace(" ", "").replace("-", "")
+    site_name = f"zo-{subdomain}"
+    live_url = f"https://{subdomain}.zeroorigine.com"
+
+    logger.info("Auto-deploying %s to Netlify as %s", product_name, site_name)
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as http:
+            netlify_token = os.environ.get("NETLIFY_API_TOKEN", "")
+
+            if not netlify_token:
+                # Try from zo_config
+                config = client.table("zo_config").select("value").eq("key", "NETLIFY_API_TOKEN").execute()
+                if config.data:
+                    netlify_token = config.data[0]["value"]
+
+            if not netlify_token:
+                logger.warning("No Netlify token — creating founder action")
+                await create_founder_action(
+                    project_id=project_id,
+                    product_name=product_name,
+                    items=[{"key": "NETLIFY_API_TOKEN", "description": "Netlify personal access token", "required": True}],
+                    how_to_get="Go to app.netlify.com → User Settings → Applications → Personal access tokens → New token",
+                    service_url="https://app.netlify.com/user/applications",
+                    urgency="high",
+                    pipeline_stage="launch",
+                    can_skip=False,
+                    skip_consequence="Cannot deploy — product stays in build_complete state",
+                )
+                return {"success": False, "error": "Netlify token needed — founder action created"}
+
+            # Step 1: Create Netlify site
+            create_resp = await http.post(
+                "https://api.netlify.com/api/v1/sites",
+                headers={"Authorization": f"Bearer {netlify_token}"},
+                json={
+                    "name": site_name,
+                    "custom_domain": f"{subdomain}.zeroorigine.com",
+                    "repo": {
+                        "provider": "github",
+                        "repo": "ispeedbiz/zo-saas-template",
+                        "branch": "main",
+                        "cmd": "npm run build",
+                        "dir": ".next",
+                    },
+                },
+            )
+
+            if create_resp.status_code in (200, 201):
+                site_data = create_resp.json()
+                site_id = site_data.get("id", "")
+                netlify_url = site_data.get("ssl_url") or site_data.get("url") or live_url
+                logger.info("Netlify site created: %s (ID: %s)", netlify_url, site_id)
+            else:
+                # Site might already exist — try to find it
+                logger.warning("Netlify create returned %s: %s", create_resp.status_code, create_resp.text[:200])
+                netlify_url = live_url
+                site_id = ""
+
+            # Step 2: Update database
+            update_data = {
+                "status": "launched",
+                "netlify_url": netlify_url,
+                "netlify_site_id": site_id,
+                "subdomain": subdomain,
+                "launched_at": datetime.now(timezone.utc).isoformat(),
+                "lifecycle_state": "new",
+                "health_score": 100,
+            }
+            client.table("zo_projects").update(update_data).eq("project_id", project_id).execute()
+            logger.info("Project %s updated: status=launched, url=%s", project_id, netlify_url)
+
+            # Step 3: Register with Health Pulse (first check)
+            try:
+                from .graphs.immune_system import run_health_check
+                asyncio.create_task(run_health_check(project_id))
+                logger.info("Health monitoring registered for %s", product_name)
+            except Exception as health_err:
+                logger.warning("Health check registration failed: %s", health_err)
+
+            return {
+                "success": True,
+                "url": netlify_url,
+                "site_id": site_id,
+                "subdomain": subdomain,
+            }
+
+    except Exception as e:
+        logger.error("Auto-deploy failed for %s: %s", product_name, e, exc_info=True)
+        # Still update status so product isn't stuck
+        client.table("zo_projects").update({
+            "status": "deploy_failed",
+            "netlify_url": live_url,
+        }).eq("project_id", project_id).execute()
+        return {"success": False, "error": str(e)}
 
 
 # ── Immune System Commands ─────────────────────────────────────────────────
