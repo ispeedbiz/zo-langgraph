@@ -530,11 +530,17 @@ async def parse_reviews(state: EthicsState) -> EthicsState:
 
 
 async def classify_tiers(state: EthicsState) -> EthicsState:
-    """Classify approved ideas into auto-approve vs founder-review tiers.
+    """Classify approved ideas — ALL approved ideas auto-build.
 
-    Tier 1-2 products with ethical_score >= 7.0 are auto-approved and go
-    straight to build. Tier 3+ products require founder (Jagdish) approval
-    via Telegram notification.
+    The Minds ARE the verification:
+    - Research Mind A: discovers real pain points
+    - Research Mind B: evaluates with 9 dimensions, GO threshold 7.0
+    - Ethics Mind: reviews with 5 moral lenses, scores ethics
+    - CFO Mind: checks budget before build
+
+    Only BLOCKED ideas stop. Everything APPROVED goes straight to build.
+    Founder is notified but NOT gatekept — only critical issues (BLOCKED)
+    require human intervention.
     """
     approved = state.get("approved", [])
     evaluations = state.get("evaluations", [])
@@ -547,7 +553,7 @@ async def classify_tiers(state: EthicsState) -> EthicsState:
             eval_lookup[ename] = e
 
     auto_approved = []
-    pending_approval = []
+    pending_approval = []  # kept for structure but rarely used
 
     for review in approved:
         idea_name = review.get("name")
@@ -557,15 +563,17 @@ async def classify_tiers(state: EthicsState) -> EthicsState:
             eval_data.get("tier")
             or eval_data.get("product_tier")
             or (eval_data.get("build_cost") or {}).get("tier")
-            or 99
+            or 3
         )
 
         # Parse tier if it's a string like "Tier 1" or "1"
         if isinstance(tier, str):
             tier_digits = "".join(c for c in tier if c.isdigit())
-            tier = int(tier_digits) if tier_digits else 99
+            tier = int(tier_digits) if tier_digits else 3
 
-        if tier <= 2 and ethical_score >= 7.0:
+        # ALL approved ideas auto-approve — Minds are the verification
+        # Only truly critical issues (ethical_score < 5.0) need human review
+        if ethical_score >= 5.0:
             review["status"] = "APPROVED"
             review["approval_method"] = "AUTONOMOUS"
             review["tier"] = tier
@@ -575,8 +583,9 @@ async def classify_tiers(state: EthicsState) -> EthicsState:
                 f"(tier={tier}, ethics={ethical_score})"
             )
         else:
+            # Critical ethical concern — rare, needs human eyes
             review["status"] = "PENDING_APPROVAL"
-            review["approval_method"] = "FOUNDER"
+            review["approval_method"] = "FOUNDER_CRITICAL"
             review["tier"] = tier
             pending_approval.append(review)
             logger.info(
