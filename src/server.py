@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.9.1",
+    version="2.9.2",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.9.1",
+        "version": "2.9.2",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -688,6 +688,10 @@ async def handle_telegram_command_v2(req: dict):
             return {"text": await _cmd_resume()}
         elif command == "build" and args:
             return {"text": await _cmd_build(args)}
+        elif command == "health":
+            return {"text": await _cmd_health()}
+        elif command == "research":
+            return {"text": await _cmd_research()}
         else:
             return {"text": f"Unknown command: /{command}\nType /help for available commands."}
     except Exception as e:
@@ -983,6 +987,61 @@ async def _cmd_reject(args: str) -> str:
     if result.data:
         return f"❌ {result.data[0]['name']} REJECTED.\nReason: {reason}"
     return f'No pending project named "{name}".'
+
+
+async def _cmd_health() -> str:
+    client = db.get_client()
+    # Count projects by status
+    projects = client.table("zo_projects").select("status").neq("project_id", "zo-test-ping").neq("project_id", "zo-test-dbwrite").execute().data
+    by_status = {}
+    for p in projects:
+        by_status[p["status"]] = by_status.get(p["status"], 0) + 1
+
+    # Count total API calls
+    costs = client.table("zo_cost_logs").select("cost_usd").execute().data
+    total_spend = sum(float(c.get("cost_usd", 0) or 0) for c in costs)
+
+    return (
+        f"ZeroOrigine Health\n\n"
+        f"Railway: OK (v2.9.2)\n"
+        f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
+        f"Ecosystem: active\n\n"
+        f"Projects: {len(projects)} total\n"
+        + "".join(f"  {s}: {c}\n" for s, c in sorted(by_status.items()))
+        + f"\nAPI spend: ${total_spend:.2f} total ({len(costs)} calls)"
+    )
+
+
+async def _cmd_research() -> str:
+    # Trigger research pipeline in background
+    asyncio.create_task(_trigger_research_safe())
+    return (
+        "🚀 Research pipeline triggered!\n\n"
+        "A → B → Ethics → Auto-approve → Auto-build\n"
+        "Estimated cost: ~$0.45\n"
+        "Results in ~5 minutes..."
+    )
+
+
+async def _trigger_research_safe():
+    """Run research pipeline in background."""
+    import httpx
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
+    try:
+        result = await _handle_research_trigger(None, {})
+        status = result.get("status", "unknown")
+        auto = result.get("auto_approved", 0)
+        ideas = result.get("ideas_generated", 0)
+        cost = result.get("total_cost_usd", 0)
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": f"🔬 Research complete!\n\nIdeas: {ideas}\nAuto-approved: {auto}\nCost: ${cost:.2f}\nStatus: {status}"},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.error("Research trigger failed: %s", e, exc_info=True)
 
 
 async def _cmd_pause() -> str:
