@@ -10,6 +10,7 @@ from .builder import run_builder
 from .build_architect import run_build_architect
 from .qa import run_qa
 from .marketing import run_marketing
+from .immune_system import run_health_check, run_hotfix, run_lifecycle_check
 
 __all__ = [
     "run_research_a",
@@ -19,4 +20,7 @@ __all__ = [
     "run_build_architect",
     "run_qa",
     "run_marketing",
+    "run_health_check",
+    "run_hotfix",
+    "run_lifecycle_check",
 ]

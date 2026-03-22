@@ -14,13 +14,13 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Any
 from . import db
-from .graphs import run_research_a, run_research_b, run_ethics, run_builder, run_build_architect, run_qa, run_marketing
+from .graphs import run_research_a, run_research_b, run_ethics, run_builder, run_build_architect, run_qa, run_marketing, run_health_check, run_hotfix, run_lifecycle_check
 
 logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.3.0",
+    version="3.4.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,8 +61,8 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.3.0",
-        "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
+        "version": "3.4.0",
+        "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
 
@@ -793,6 +793,12 @@ async def handle_telegram_command_v2(req: dict):
             return {"text": await _cmd_actions()}
         elif command == "skip":
             return {"text": await _cmd_skip(args)}
+        elif command == "hotfix":
+            return {"text": await _cmd_hotfix(args)}
+        elif command == "lifecycle":
+            return {"text": await _cmd_lifecycle()}
+        elif command == "learnings":
+            return {"text": await _cmd_learnings()}
         else:
             return {"text": f"Unknown command: /{command}\nType /help for available commands."}
     except Exception as e:
@@ -821,6 +827,11 @@ CREDENTIALS:
 /actions — Pending founder actions
 /config FA-xxx KEY=VALUE — Provide a credential
 /skip FA-xxx SERVICE — Launch without feature
+
+OPERATIONS:
+/hotfix [name] [issue] — Auto-repair a product
+/lifecycle — Product lifecycle states
+/learnings — Recent ecosystem learnings
 
 CONTROLS:
 /health — System health
@@ -1109,7 +1120,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.3.0)\n"
+        f"Railway: OK (v3.4.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1490,3 +1501,93 @@ async def _run_builder_safe(project_id: str, product_name: str):
         logger.error("Builder Mind crashed for %s: %s", product_name, e, exc_info=True)
         db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
         await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}")
+
+
+# ── Immune System Commands ─────────────────────────────────────────────────
+
+
+async def _cmd_hotfix(args: str) -> str:
+    if not args:
+        return "Usage: /hotfix [product_name] [issue description]"
+    parts = args.split(None, 1)
+    name = parts[0]
+    issue = parts[1] if len(parts) > 1 else "General health issue"
+    # Find project
+    client = db.get_client()
+    projects = client.table("zo_projects").select("project_id,name").ilike("name", name).execute().data
+    if not projects:
+        return f'No product named "{name}". Type /projects.'
+    asyncio.create_task(_run_hotfix_safe(projects[0]["project_id"], projects[0]["name"], issue))
+    return f"🔧 Hotfix pipeline started for {projects[0]['name']}\nIssue: {issue}\nYou'll get a notification when done."
+
+
+async def _cmd_lifecycle() -> str:
+    client = db.get_client()
+    projects = client.table("zo_projects").select(
+        "name,status,lifecycle_state,health_score"
+    ).neq("project_id", "zo-test-ping").neq("project_id", "zo-test-dbwrite").execute().data
+    if not projects:
+        return "No projects found."
+    msg = "Product Lifecycle States\n\n"
+    for p in projects:
+        state = p.get("lifecycle_state", "new")
+        score = p.get("health_score", "?")
+        emoji = {"thriving": "🟢", "stable": "🔵", "struggling": "🟡", "dying": "🔴", "new": "⚪"}.get(state, "⚪")
+        msg += f"{emoji} {p['name']} — {state} (health: {score})\n"
+    return msg
+
+
+async def _cmd_learnings() -> str:
+    client = db.get_client()
+    try:
+        learnings = client.table("ecosystem_learnings").select(
+            "category,learning,created_at"
+        ).order("created_at", desc=True).limit(10).execute().data
+    except Exception:
+        learnings = []
+    if not learnings:
+        return "No ecosystem learnings yet. They accumulate from QA feedback and retrospectives."
+    msg = "Recent Ecosystem Learnings\n\n"
+    for l in learnings:
+        msg += f"• [{l.get('category', '?')}] {(l.get('learning', ''))[:100]}\n"
+    return msg
+
+
+async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
+    """Run Hotfix pipeline in background with Telegram notification."""
+    import httpx as _httpx
+    import os
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+
+    async def notify(text: str):
+        try:
+            async with _httpx.AsyncClient() as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": text},
+                    timeout=10,
+                )
+        except Exception as e:
+            logger.error("Failed to send Telegram notification: %s", e)
+
+    try:
+        result = await run_hotfix(project_id=project_id, issue=issue)
+
+        if result.get("error"):
+            await notify(
+                f"❌ Hotfix FAILED for {product_name}\n\n"
+                f"Error: {str(result['error'])[:200]}"
+            )
+        else:
+            verified = result.get("verified", False)
+            status_emoji = "✅" if verified else "⚠️"
+            await notify(
+                f"{status_emoji} Hotfix {'VERIFIED' if verified else 'NEEDS REVIEW'} for {product_name}\n\n"
+                f"Diagnosis: {str(result.get('diagnosis', ''))[:200]}\n\n"
+                f"Patch: {str(result.get('patch_description', ''))[:200]}\n\n"
+                f"Cost: ${result.get('cost_usd', 0):.2f}"
+            )
+    except Exception as e:
+        logger.error("Hotfix pipeline crashed for %s: %s", product_name, e, exc_info=True)
+        await notify(f"❌ Hotfix CRASHED for {product_name}\n\nError: {str(e)[:200]}")
