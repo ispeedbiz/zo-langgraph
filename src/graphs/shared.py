@@ -91,6 +91,8 @@ class QAState(TypedDict, total=False):
     project_id: str
     project: dict
     deploy_url: str
+    # Pipeline Architect QA context (BCMs for QA)
+    qa_context: dict
     # QA results by category
     test_results: dict[str, dict]  # category → {passed, score, issues}
     overall_score: int
@@ -114,6 +116,8 @@ class MarketingState(TypedDict, total=False):
     """State for the Marketing content pipeline."""
     project_id: str
     project: dict
+    # Pipeline Architect marketing context (BCMs for Marketing)
+    marketing_context: dict
     # Generated content
     linkedin_posts: list[str]
     twitter_posts: list[str]

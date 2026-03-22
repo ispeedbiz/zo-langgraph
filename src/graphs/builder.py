@@ -699,7 +699,7 @@ async def step_3_core(state: BuildState) -> BuildState:
         state.get("schema_sql", ""),
         state.get("api_code", ""),
     )
-    learnings_ctx = _format_learnings(state.get("learnings", []))
+    extra_ctx = _build_extra_context(state)
 
     user_msg = (
         f"Generate the core components and pages for {name}.\n\n"
@@ -715,7 +715,7 @@ async def step_3_core(state: BuildState) -> BuildState:
         workflow="builder",
         max_tokens=8000,
         temperature=0.3,
-        extra_context=learnings_ctx or None,
+        extra_context=extra_ctx,
     )
 
     state = accumulate_cost(state, response)
@@ -748,7 +748,7 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
     description = project.get("description", "A SaaS product")
 
     system = _system_prompt_auth_payments(name, category, description)
-    learnings_ctx = _format_learnings(state.get("learnings", []))
+    extra_ctx = _build_extra_context(state)
 
     user_msg = (
         f"Generate auth + Stripe payments for {name}.\n\n"
@@ -766,7 +766,7 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
         workflow="builder",
         max_tokens=8000,
         temperature=0.2,
-        extra_context=learnings_ctx or None,
+        extra_context=extra_ctx,
     )
 
     state = accumulate_cost(state, response)
@@ -799,7 +799,7 @@ async def step_5_landing(state: BuildState) -> BuildState:
     description = project.get("description", "A SaaS product")
 
     system = _system_prompt_landing(name, category, description)
-    learnings_ctx = _format_learnings(state.get("learnings", []))
+    extra_ctx = _build_extra_context(state)
 
     user_msg = (
         f"Generate a high-converting landing page for {name}.\n\n"
@@ -817,7 +817,7 @@ async def step_5_landing(state: BuildState) -> BuildState:
         workflow="builder",
         max_tokens=8000,
         temperature=0.4,
-        extra_context=learnings_ctx or None,
+        extra_context=extra_ctx,
     )
 
     state = accumulate_cost(state, response)

@@ -276,11 +276,21 @@ async def _run_tests(state: QAState) -> QAState:
         f"Run the full 7-category test suite. Be thorough and precise."
     )
 
+    # Inject Pipeline Architect QA BCMs if available
+    qa_ctx = state.get("qa_context", {})
+    qa_bcm_context = qa_ctx.get("bcm_context", "") if qa_ctx else ""
+
     # Fetch any learnings from previous QA runs to look for known patterns
     learnings = await db.get_learnings_for_category(project.get("category", ""))
     extra_context = None
-    if learnings:
+    if qa_bcm_context:
         extra_context = (
+            "=== QA CAPABILITY MODULES (from Pipeline Architect) ===\n"
+            "Use these as authoritative reference for what and how to test.\n\n"
+            + qa_bcm_context + "\n\n"
+        )
+    if learnings:
+        learnings_text = (
             "ECOSYSTEM LEARNINGS — Known issues from previous products. "
             "Check if any of these patterns appear in this product:\n"
             + "\n".join(
@@ -289,6 +299,7 @@ async def _run_tests(state: QAState) -> QAState:
                 for l in learnings
             )
         )
+        extra_context = (extra_context or "") + learnings_text
 
     response = await claude.call(
         agent_name="qa",
@@ -583,7 +594,7 @@ def _build_graph() -> StateGraph:
 
 # ── Public Entry Point ──────────────────────────────────────
 
-async def run_qa(project_id: str) -> QAState:
+async def run_qa(project_id: str, qa_context: dict | None = None) -> QAState:
     """Run the full QA pipeline for a project.
 
     Loads project data, executes the 7-category test suite, performs root cause
@@ -592,6 +603,7 @@ async def run_qa(project_id: str) -> QAState:
 
     Args:
         project_id: The zo_projects.project_id to test.
+        qa_context: Optional dict from Pipeline Architect with QA BCMs and capabilities.
 
     Returns:
         Final QAState with test results, scores, learnings, and status.
@@ -645,6 +657,7 @@ async def run_qa(project_id: str) -> QAState:
         "project_id": project_id,
         "project": project,
         "deploy_url": project.get("deploy_url", ""),
+        "qa_context": qa_context or {},
         "test_results": {},
         "overall_score": 0,
         "max_score": MAX_SCORE,

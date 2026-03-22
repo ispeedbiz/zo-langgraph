@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.0.0",
+    version="3.1.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -535,11 +535,38 @@ async def _handle_human_approved(project_id: str | None, payload: dict) -> dict:
 
 
 async def _handle_build_complete(project_id: str | None, payload: dict) -> dict:
-    """Build finished → trigger QA pipeline."""
+    """Build finished → trigger QA pipeline with pipeline context."""
     if not project_id:
         return {"status": "error", "reason": "no project_id"}
 
-    state = await run_qa(project_id=project_id)
+    # Load pipeline manifest for QA context
+    qa_context = None
+    try:
+        manifest = db.get_client().table("zo_build_manifests").select("*").eq(
+            "project_id", project_id
+        ).order("manifest_id", desc=True).limit(1).execute()
+        if manifest.data:
+            qa_bcm_ids = manifest.data[0].get("qa_bcms_loaded", [])
+            if qa_bcm_ids:
+                # Fetch the actual BCM contents
+                bcms = db.get_client().table("zo_builder_modules").select("*").in_(
+                    "module_id", qa_bcm_ids
+                ).execute()
+                bcm_contents = [
+                    {"module_id": b["module_id"], "name": b.get("name", ""),
+                     "capabilities": b.get("capabilities", []), "content": b.get("content", "")}
+                    for b in (bcms.data or [])
+                ]
+                from .graphs.build_architect import _format_bcm_context
+                qa_context = {
+                    "bcms_loaded": qa_bcm_ids,
+                    "bcm_modules": bcm_contents,
+                    "bcm_context": _format_bcm_context(bcm_contents),
+                }
+    except Exception as e:
+        logger.warning("Failed to load pipeline manifest for QA context: %s", e)
+
+    state = await run_qa(project_id=project_id, qa_context=qa_context)
     return {
         "status": state.get("status", "unknown"),
         "score": f"{state.get('overall_score', 0)}/{state.get('max_score', 140)}",
@@ -556,11 +583,37 @@ async def _handle_qa_passed(project_id: str | None, payload: dict) -> dict:
 
 
 async def _handle_launched(project_id: str | None, payload: dict) -> dict:
-    """Product launched → trigger Marketing pipeline."""
+    """Product launched → trigger Marketing pipeline with pipeline context."""
     if not project_id:
         return {"status": "error", "reason": "no project_id"}
 
-    state = await run_marketing(project_id=project_id)
+    # Load pipeline manifest for marketing context
+    marketing_context = None
+    try:
+        manifest = db.get_client().table("zo_build_manifests").select("*").eq(
+            "project_id", project_id
+        ).order("manifest_id", desc=True).limit(1).execute()
+        if manifest.data:
+            mkt_bcm_ids = manifest.data[0].get("marketing_bcms_loaded", [])
+            if mkt_bcm_ids:
+                bcms = db.get_client().table("zo_builder_modules").select("*").in_(
+                    "module_id", mkt_bcm_ids
+                ).execute()
+                bcm_contents = [
+                    {"module_id": b["module_id"], "name": b.get("name", ""),
+                     "capabilities": b.get("capabilities", []), "content": b.get("content", "")}
+                    for b in (bcms.data or [])
+                ]
+                from .graphs.build_architect import _format_bcm_context
+                marketing_context = {
+                    "bcms_loaded": mkt_bcm_ids,
+                    "bcm_modules": bcm_contents,
+                    "bcm_context": _format_bcm_context(bcm_contents),
+                }
+    except Exception as e:
+        logger.warning("Failed to load pipeline manifest for marketing context: %s", e)
+
+    state = await run_marketing(project_id=project_id, marketing_context=marketing_context)
     return {
         "status": state.get("status", "unknown"),
         "linkedin_posts": len(state.get("linkedin_posts", [])),
@@ -1003,7 +1056,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.0.0)\n"
+        f"Railway: OK (v3.1.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1105,11 +1158,28 @@ async def _run_builder_safe(project_id: str, product_name: str):
         architect_result = await run_build_architect(project_id, project_data)
 
         if not architect_result.get("build_ready"):
-            await notify(f"⚠️ Build Architect: {product_name} not ready\n\n{architect_result.get('reason', 'Unknown')}")
+            await notify(f"⚠️ Pipeline Architect: {product_name} not ready\n\n{architect_result.get('reason', 'Unknown')}")
             return
 
-        # Pass BCM context to builder
-        build_context = architect_result.get("build_package", {})
+        # Extract the full pipeline manifest
+        manifest = architect_result.get("build_package", {})
+
+        # Store manifest for downstream Minds (QA, Marketing) to consume later
+        try:
+            db.get_client().table("zo_build_manifests").upsert({
+                "manifest_id": f"pm-{project_id}",
+                "project_id": project_id,
+                "qa_bcms_loaded": manifest.get("qa_context", {}).get("bcms_loaded", []),
+                "marketing_bcms_loaded": manifest.get("marketing_context", {}).get("bcms_loaded", []),
+                "launch_bcms_loaded": manifest.get("launch_context", {}).get("bcms_loaded", []),
+                "pipeline_ready": manifest.get("pipeline_ready", False),
+                "build_ready": manifest.get("build_ready", True),
+            }, on_conflict="manifest_id").execute()
+        except Exception as e:
+            logger.warning("Failed to upsert pipeline manifest in _run_builder_safe: %s", e)
+
+        # Pass build context to builder (backward compatible)
+        build_context = manifest
 
         state = await run_builder(project_id=project_id, build_context=build_context)
 
@@ -1135,9 +1205,12 @@ async def _run_builder_safe(project_id: str, product_name: str):
             )
             logger.info("Builder completed for %s. Cost: $%.2f", product_name, cost)
 
-            # Trigger QA automatically
+            # Load QA context from the pipeline manifest
+            qa_context = manifest.get("qa_context")
+
+            # Trigger QA automatically with pipeline context
             try:
-                qa_state = await run_qa(project_id=project_id)
+                qa_state = await run_qa(project_id=project_id, qa_context=qa_context)
                 if qa_state.get("passed"):
                     db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
                     await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")

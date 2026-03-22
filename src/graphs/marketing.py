@@ -241,9 +241,20 @@ Output JSON with exactly these keys:
 
     logger.info("Marketing Mind: Generating social content for %s", product_name)
 
+    # Inject Pipeline Architect marketing BCMs if available
+    mkt_ctx = state.get("marketing_context", {})
+    mkt_bcm_context = mkt_ctx.get("bcm_context", "") if mkt_ctx else ""
+    system_prompt = MARKETING_SYSTEM_PROMPT
+    if mkt_bcm_context:
+        system_prompt += (
+            "\n\n=== MARKETING CAPABILITY MODULES (from Pipeline Architect) ===\n"
+            "Use these as authoritative reference for audience, messaging, and channels.\n\n"
+            + mkt_bcm_context
+        )
+
     response = await claude.call(
         agent_name="marketing",
-        system_prompt=MARKETING_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         project_id=state["project_id"],
         workflow="marketing",
@@ -342,9 +353,20 @@ Output JSON with exactly these keys:
 
     logger.info("Marketing Mind: Generating launch content for %s", product_name)
 
+    # Inject Pipeline Architect marketing BCMs if available
+    mkt_ctx = state.get("marketing_context", {})
+    mkt_bcm_context = mkt_ctx.get("bcm_context", "") if mkt_ctx else ""
+    system_prompt = MARKETING_SYSTEM_PROMPT
+    if mkt_bcm_context:
+        system_prompt += (
+            "\n\n=== MARKETING CAPABILITY MODULES (from Pipeline Architect) ===\n"
+            "Use these as authoritative reference for audience, messaging, and channels.\n\n"
+            + mkt_bcm_context
+        )
+
     response = await claude.call(
         agent_name="marketing",
-        system_prompt=MARKETING_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         project_id=state["project_id"],
         workflow="marketing",
@@ -446,9 +468,20 @@ Output JSON with exactly this key:
 
     logger.info("Marketing Mind: Generating email sequence for %s", product_name)
 
+    # Inject Pipeline Architect marketing BCMs if available
+    mkt_ctx = state.get("marketing_context", {})
+    mkt_bcm_context = mkt_ctx.get("bcm_context", "") if mkt_ctx else ""
+    system_prompt = MARKETING_SYSTEM_PROMPT
+    if mkt_bcm_context:
+        system_prompt += (
+            "\n\n=== MARKETING CAPABILITY MODULES (from Pipeline Architect) ===\n"
+            "Use these as authoritative reference for audience, messaging, and channels.\n\n"
+            + mkt_bcm_context
+        )
+
     response = await claude.call(
         agent_name="marketing",
-        system_prompt=MARKETING_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         project_id=state["project_id"],
         workflow="marketing",
@@ -583,7 +616,7 @@ def build_marketing_graph() -> StateGraph:
 
 # ── Entry Point ──────────────────────────────────────────────────────────
 
-async def run_marketing(project_id: str) -> MarketingState:
+async def run_marketing(project_id: str, marketing_context: dict | None = None) -> MarketingState:
     """
     Run the full marketing content pipeline for a launched project.
 
@@ -592,6 +625,7 @@ async def run_marketing(project_id: str) -> MarketingState:
 
     Args:
         project_id: The zo_projects.project_id to generate marketing for.
+        marketing_context: Optional dict from Pipeline Architect with Marketing BCMs.
 
     Returns:
         Final MarketingState with all generated content and cost tracking.
@@ -616,6 +650,7 @@ async def run_marketing(project_id: str) -> MarketingState:
     initial_state: MarketingState = {
         "project_id": project_id,
         "project": project,
+        "marketing_context": marketing_context or {},
         "linkedin_posts": [],
         "twitter_posts": [],
         "community_posts": [],
