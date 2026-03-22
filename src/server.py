@@ -14,13 +14,13 @@ from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 from typing import Any
 from . import db
-from .graphs import run_research_a, run_research_b, run_ethics, run_builder, run_qa, run_marketing
+from .graphs import run_research_a, run_research_b, run_ethics, run_builder, run_build_architect, run_qa, run_marketing
 
 logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.9.2",
+    version="3.0.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.9.2",
+        "version": "3.0.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1003,7 +1003,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v2.9.2)\n"
+        f"Railway: OK (v3.0.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1097,7 +1097,21 @@ async def _run_builder_safe(project_id: str, product_name: str):
 
     try:
         logger.info("Builder Mind starting for %s (%s)", product_name, project_id)
-        state = await run_builder(project_id=project_id)
+
+        # Run Build Architect first -- pre-build intelligence layer
+        project_data = db.get_client().table("zo_projects").select("*").eq("project_id", project_id).execute()
+        project_data = project_data.data[0] if project_data.data else {}
+
+        architect_result = await run_build_architect(project_id, project_data)
+
+        if not architect_result.get("build_ready"):
+            await notify(f"⚠️ Build Architect: {product_name} not ready\n\n{architect_result.get('reason', 'Unknown')}")
+            return
+
+        # Pass BCM context to builder
+        build_context = architect_result.get("build_package", {})
+
+        state = await run_builder(project_id=project_id, build_context=build_context)
 
         if state.get("error"):
             # Build failed

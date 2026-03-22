@@ -75,6 +75,8 @@ class BuildState(TypedDict, total=False):
     deploy_url: str
     # Learnings injected
     learnings: list[dict]
+    # BCM context from Build Architect
+    bcm_context: str
     # Control
     current_step: int
     total_steps: int

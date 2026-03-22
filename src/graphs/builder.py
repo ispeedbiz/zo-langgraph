@@ -53,6 +53,18 @@ def _format_learnings(learnings: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _build_extra_context(state: BuildState) -> str | None:
+    """Combine ecosystem learnings and BCM context into a single extra_context string."""
+    parts = []
+    learnings_ctx = _format_learnings(state.get("learnings", []))
+    if learnings_ctx:
+        parts.append(learnings_ctx)
+    bcm_ctx = state.get("bcm_context", "")
+    if bcm_ctx:
+        parts.append(bcm_ctx)
+    return "\n\n".join(parts) if parts else None
+
+
 async def _save_step_checkpoint(
     state: BuildState,
     step_number: int,
@@ -582,7 +594,7 @@ async def step_1_schema(state: BuildState) -> BuildState:
     description = project.get("description", "A SaaS product")
 
     system = _system_prompt_schema(name, category, description)
-    learnings_ctx = _format_learnings(state.get("learnings", []))
+    extra_ctx = _build_extra_context(state)
 
     user_msg = (
         f"Generate the complete PostgreSQL schema for {name}.\n"
@@ -599,7 +611,7 @@ async def step_1_schema(state: BuildState) -> BuildState:
         workflow="builder",
         max_tokens=8000,
         temperature=0.2,
-        extra_context=learnings_ctx or None,
+        extra_context=extra_ctx,
     )
 
     state = accumulate_cost(state, response)
@@ -633,7 +645,7 @@ async def step_2_api(state: BuildState) -> BuildState:
     description = project.get("description", "A SaaS product")
 
     system = _system_prompt_api(name, category, description)
-    learnings_ctx = _format_learnings(state.get("learnings", []))
+    extra_ctx = _build_extra_context(state)
 
     user_msg = (
         f"Generate the API routes for {name}.\n\n"
@@ -649,7 +661,7 @@ async def step_2_api(state: BuildState) -> BuildState:
         workflow="builder",
         max_tokens=8000,
         temperature=0.2,
-        extra_context=learnings_ctx or None,
+        extra_context=extra_ctx,
     )
 
     state = accumulate_cost(state, response)
@@ -953,6 +965,7 @@ def _build_graph(resume_from: int | None = None) -> StateGraph:
 async def run_builder(
     project_id: str,
     resume_from: int | None = None,
+    build_context: dict | None = None,
 ) -> BuildState:
     """
     Run the Builder Mind pipeline.
@@ -962,6 +975,8 @@ async def run_builder(
         resume_from: If set, skip steps 1..resume_from-1 and resume from that
                      step.  The skipped steps' outputs are loaded from the
                      latest checkpoint.
+        build_context: Optional build package from Build Architect containing
+                       BCM modules and capability analysis.
 
     Returns:
         Final BuildState with all generated code artifacts.
@@ -994,6 +1009,7 @@ async def run_builder(
         "auth_payments_code": "",
         "landing_page": "",
         "learnings": learnings,
+        "bcm_context": build_context.get("bcm_context", "") if build_context else "",
         "current_step": 0,
         "total_steps": TOTAL_STEPS,
         "total_tokens": 0,
