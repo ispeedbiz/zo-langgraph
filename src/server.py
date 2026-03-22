@@ -9,8 +9,10 @@ v2.1 — Graphs wired. Every handler executes real LangGraph agents.
 import asyncio
 import json
 import logging
+import random
+import string
 from datetime import datetime, timezone
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from pydantic import BaseModel
 from typing import Any
 from . import db
@@ -20,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.5.0",
+    version="3.6.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +63,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.5.0",
+        "version": "3.6.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -799,6 +801,8 @@ async def handle_telegram_command_v2(req: dict):
             return {"text": await _cmd_lifecycle()}
         elif command == "learnings":
             return {"text": await _cmd_learnings()}
+        elif command == "supporters":
+            return {"text": await _cmd_supporters()}
         else:
             return {"text": f"Unknown command: /{command}\nType /help for available commands."}
     except Exception as e:
@@ -827,6 +831,9 @@ CREDENTIALS:
 /actions — Pending founder actions
 /config FA-xxx KEY=VALUE — Provide a credential
 /skip FA-xxx SERVICE — Launch without feature
+
+SUPPORTERS:
+/supporters — List all supporters & donations
 
 OPERATIONS:
 /hotfix [name] [issue] — Auto-repair a product
@@ -1120,7 +1127,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.5.0)\n"
+        f"Railway: OK (v3.6.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1688,6 +1695,22 @@ async def _cmd_learnings() -> str:
     return msg
 
 
+async def _cmd_supporters() -> str:
+    client = db.get_client()
+    members = client.table("zo_members").select(
+        "member_id,display_name,total_donated,donation_count,joined_at"
+    ).eq("status", "active").order("joined_at").execute().data
+    if not members:
+        return "No supporters yet.\n\nShare zeroorigine.com to get your first supporter!"
+    total_raised = sum(float(m.get("total_donated", 0)) for m in members)
+    msg = f"ZeroOrigine Supporters ({len(members)})\nTotal raised: ${total_raised:.2f}\n\n"
+    for m in members:
+        name = m.get("display_name") or "Anonymous"
+        donated = float(m.get("total_donated", 0))
+        msg += f"  {m['member_id']} — {name} (${donated:.2f})\n"
+    return msg
+
+
 async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
     """Run Hotfix pipeline in background with Telegram notification."""
     import httpx as _httpx
@@ -1726,3 +1749,155 @@ async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
     except Exception as e:
         logger.error("Hotfix pipeline crashed for %s: %s", product_name, e, exc_info=True)
         await notify(f"❌ Hotfix CRASHED for {product_name}\n\nError: {str(e)[:200]}")
+
+
+# ── Donation Endpoints (H-035) ────────────────────────
+
+def _gen_zo_id(prefix: str) -> str:
+    """Generate a ZeroOrigine ID like ZO-M-260322-AB1C."""
+    d = datetime.now()
+    rand = ''.join(random.choices(string.ascii_uppercase + string.digits, k=4))
+    return f"ZO-{prefix}-{d.strftime('%y%m%d')}-{rand}"
+
+
+@app.post("/donations/create-checkout")
+async def create_donation_checkout(req: dict):
+    """Create a Stripe Checkout session for a donation."""
+    import stripe
+    import os
+
+    amount_cents = int(float(req.get("amount", 10)) * 100)
+    if amount_cents < 100:
+        raise HTTPException(status_code=400, detail="Minimum donation is $1")
+
+    email = req.get("email", "")
+
+    stripe.api_key = os.environ.get("STRIPE_SECRET_KEY", "")
+    if not stripe.api_key:
+        config = db.get_client().table("zo_config").select("value").eq("key", "STRIPE_SECRET_KEY").execute()
+        if config.data:
+            stripe.api_key = config.data[0]["value"]
+
+    session = stripe.checkout.Session.create(
+        payment_method_types=["card"],
+        line_items=[{
+            "price_data": {
+                "currency": "usd",
+                "product_data": {
+                    "name": "Support ZeroOrigine",
+                    "description": "Support the world's first AI-native institution",
+                },
+                "unit_amount": amount_cents,
+            },
+            "quantity": 1,
+        }],
+        mode="payment",
+        success_url="https://zeroorigine.com/thank-you?session_id={CHECKOUT_SESSION_ID}",
+        cancel_url="https://zeroorigine.com/#support",
+        customer_email=email if email else None,
+        metadata={"type": "donation"},
+    )
+
+    return {"checkout_url": session.url, "session_id": session.id}
+
+
+@app.post("/donations/webhook")
+async def handle_donation_webhook(req: Request):
+    """Handle Stripe webhook for completed donations."""
+    import stripe
+    import os
+
+    payload = await req.body()
+    sig_header = req.headers.get("stripe-signature", "")
+    webhook_secret = os.environ.get("STRIPE_WEBHOOK_SECRET", "")
+
+    try:
+        event = stripe.Webhook.construct_event(payload, sig_header, webhook_secret)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if event["type"] == "checkout.session.completed":
+        session = event["data"]["object"]
+        if session.get("metadata", {}).get("type") == "donation":
+            await _process_donation(session)
+
+    return {"received": True}
+
+
+async def _process_donation(session: dict):
+    """Process a completed donation — create/update member + donation record."""
+    client = db.get_client()
+    email = session.get("customer_email") or session.get("customer_details", {}).get("email", "")
+    amount = session.get("amount_total", 0) / 100
+    payment_ref = session.get("payment_intent", "")
+
+    # Check if member exists
+    existing = client.table("zo_members").select("member_id,total_donated,donation_count").eq("email", email).execute()
+
+    if existing.data:
+        member = existing.data[0]
+        member_id = member["member_id"]
+        # Update existing member
+        client.table("zo_members").update({
+            "last_donation_at": datetime.now(timezone.utc).isoformat(),
+            "total_donated": float(member.get("total_donated", 0)) + amount,
+            "donation_count": int(member.get("donation_count", 0)) + 1,
+        }).eq("member_id", member_id).execute()
+        is_new = False
+    else:
+        # Create new member
+        member_id = _gen_zo_id("M")
+        client.table("zo_members").insert({
+            "member_id": member_id,
+            "email": email,
+            "status": "active",
+            "last_donation_at": datetime.now(timezone.utc).isoformat(),
+            "total_donated": amount,
+            "donation_count": 1,
+            "email_daily_products": True,
+        }).execute()
+        is_new = True
+        # Log join event
+        client.table("zo_member_events").insert({
+            "member_id": member_id,
+            "event_type": "joined",
+            "details": json.dumps({"source": "stripe_donation"}),
+        }).execute()
+
+    # Create donation record
+    donation_id = _gen_zo_id("D")
+    receipt_number = _gen_zo_id("R")
+    client.table("zo_donations").insert({
+        "donation_id": donation_id,
+        "member_id": member_id,
+        "amount": amount,
+        "currency": "usd",
+        "payment_method": "stripe",
+        "payment_ref": payment_ref,
+        "receipt_number": receipt_number,
+    }).execute()
+
+    # Log donation event
+    client.table("zo_member_events").insert({
+        "member_id": member_id,
+        "event_type": "donated",
+        "details": json.dumps({"amount": amount, "donation_id": donation_id}),
+    }).execute()
+
+    # Send Telegram notification
+    import httpx
+    import os
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+    new_label = "NEW MEMBER!" if is_new else "Returning supporter"
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": f"DONATION RECEIVED!\n\n{new_label}\nAmount: ${amount:.2f}\nMember: {member_id}\nReceipt: {receipt_number}"},
+                timeout=10,
+            )
+    except Exception:
+        pass
+
+    logger.info("Donation processed: %s from %s ($%.2f)", donation_id, member_id, amount)
