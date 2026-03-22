@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.2.0",
+    version="3.3.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.2.0",
+        "version": "3.3.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -576,10 +576,52 @@ async def _handle_build_complete(project_id: str | None, payload: dict) -> dict:
 
 
 async def _handle_qa_passed(project_id: str | None, payload: dict) -> dict:
-    """QA passed → trigger Launch (infrastructure handled by n8n)."""
-    # Emit event for n8n Workflow A to handle Netlify/Stripe/DNS
-    await db.emit_event("launch_started", project_id, "langgraph", payload)
-    return {"next": "launch_pipeline_n8n", "project_id": project_id}
+    """QA passed → trigger Marketing pipeline + prepare for Launch."""
+    if not project_id:
+        return {"status": "error", "reason": "no project_id"}
+
+    # Update project status
+    db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
+
+    # Trigger Marketing Mind with pipeline context
+    marketing_context = None
+    try:
+        manifest = db.get_client().table("zo_build_manifests").select("*").eq(
+            "project_id", project_id
+        ).order("manifest_id", desc=True).limit(1).execute()
+        if manifest.data:
+            mkt_bcm_ids = manifest.data[0].get("marketing_bcms_loaded", [])
+            if mkt_bcm_ids:
+                bcms = db.get_client().table("zo_builder_modules").select("*").in_(
+                    "module_id", mkt_bcm_ids
+                ).execute()
+                bcm_contents = [
+                    {"module_id": b["module_id"], "content": b.get("content", "")}
+                    for b in (bcms.data or [])
+                ]
+                from .graphs.build_architect import _format_bcm_context
+                marketing_context = {
+                    "bcms_loaded": mkt_bcm_ids,
+                    "bcm_context": _format_bcm_context(bcm_contents),
+                }
+    except Exception as e:
+        logger.warning("Failed to load marketing context: %s", e)
+
+    state = await run_marketing(project_id=project_id, marketing_context=marketing_context)
+
+    # Emit launch event for n8n to handle infrastructure (Netlify/Stripe/DNS)
+    await db.emit_event("launch_started", project_id, "langgraph", {
+        **payload,
+        "marketing_complete": True,
+        "marketing_cost": state.get("total_cost_usd", 0),
+    })
+
+    return {
+        "status": "marketing_complete",
+        "project_id": project_id,
+        "marketing_cost": state.get("total_cost_usd", 0),
+        "next": "launch_pipeline",
+    }
 
 
 async def _handle_launched(project_id: str | None, payload: dict) -> dict:
@@ -1067,7 +1109,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.2.0)\n"
+        f"Railway: OK (v3.3.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1428,7 +1470,15 @@ async def _run_builder_safe(project_id: str, product_name: str):
                 qa_state = await run_qa(project_id=project_id, qa_context=qa_context)
                 if qa_state.get("passed"):
                     db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
-                    await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
+                    await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}\n\n📢 Marketing Mind starting...")
+
+                    # Trigger Marketing Mind automatically
+                    try:
+                        mkt_result = await _handle_qa_passed(project_id, {"product_name": product_name})
+                        await notify(f"📢 Marketing COMPLETE for {product_name}!\nCost: ${mkt_result.get('marketing_cost', 0):.2f}\n\n🚀 Ready for launch.")
+                    except Exception as mkt_err:
+                        logger.error("Marketing failed for %s: %s", product_name, mkt_err)
+                        await notify(f"⚠️ Marketing error for {product_name}: {str(mkt_err)[:150]}\n\nProduct still QA-passed — can launch without marketing.")
                 else:
                     db.get_client().table("zo_projects").update({"status": "qa_failed"}).eq("project_id", project_id).execute()
                     await notify(f"⚠️ QA needs fixes for {product_name}\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
