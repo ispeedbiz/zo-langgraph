@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.1.0",
+    version="3.2.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -745,6 +745,12 @@ async def handle_telegram_command_v2(req: dict):
             return {"text": await _cmd_health()}
         elif command == "research":
             return {"text": await _cmd_research()}
+        elif command == "config":
+            return {"text": await _cmd_config(args)}
+        elif command == "actions":
+            return {"text": await _cmd_actions()}
+        elif command == "skip":
+            return {"text": await _cmd_skip(args)}
         else:
             return {"text": f"Unknown command: /{command}\nType /help for available commands."}
     except Exception as e:
@@ -768,6 +774,11 @@ ACTIONS:
 /approve [name] — Approve a project
 /reject [name] [reason] — Reject
 /build [name] — Start building
+
+CREDENTIALS:
+/actions — Pending founder actions
+/config FA-xxx KEY=VALUE — Provide a credential
+/skip FA-xxx SERVICE — Launch without feature
 
 CONTROLS:
 /health — System health
@@ -1056,7 +1067,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.1.0)\n"
+        f"Railway: OK (v3.2.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1095,6 +1106,210 @@ async def _trigger_research_safe():
             )
     except Exception as e:
         logger.error("Research trigger failed: %s", e, exc_info=True)
+
+
+async def _cmd_config(args: str) -> str:
+    """Set a founder action value. Format: /config FA-047 TWILIO_SID=ACxxxxxxxx"""
+    parts = args.split(None, 1)
+    if len(parts) < 2 or '=' not in parts[1]:
+        return "Usage: /config FA-xxx KEY=VALUE\nExample: /config FA-047 TWILIO_SID=ACxxxxxxxx"
+
+    action_id = parts[0].upper()
+    key_value = parts[1]
+    key, value = key_value.split('=', 1)
+    key = key.strip()
+    value = value.strip()
+
+    client = db.get_client()
+
+    # Find the founder action
+    result = client.table("zo_founder_actions").select("*").eq("action_id", action_id).execute()
+    if not result.data:
+        return f"No action found with ID {action_id}. Type /actions to see pending."
+
+    action = result.data[0]
+    items = action.get("items", [])
+    items_received = action.get("items_received", {})
+    if isinstance(items, str):
+        items = json.loads(items)
+    if isinstance(items_received, str):
+        items_received = json.loads(items_received)
+
+    # Check if this key is expected
+    expected_keys = [item.get("key") for item in items]
+    if key not in expected_keys:
+        return f"'{key}' is not expected for {action_id}.\nExpected keys: {', '.join(expected_keys)}"
+
+    # Store the value in zo_config (ecosystem config table)
+    try:
+        client.table("zo_config").upsert({
+            "key": f"{action['project_id']}_{key}",
+            "value": value,
+        }, on_conflict="key").execute()
+    except Exception:
+        client.table("zo_config").insert({
+            "key": f"{action['project_id']}_{key}",
+            "value": value,
+        }).execute()
+
+    # Update items_received
+    items_received[key] = {
+        "received_at": datetime.now(timezone.utc).isoformat(),
+        "validated": True,  # TODO: add actual validation
+    }
+
+    # Check if all required items received
+    required_keys = [item["key"] for item in items if item.get("required", True)]
+    all_received = all(k in items_received for k in required_keys)
+    remaining = [k for k in required_keys if k not in items_received]
+
+    new_status = "completed" if all_received else "partial"
+    update_data = {
+        "items_received": json.dumps(items_received),
+        "status": new_status,
+    }
+    if all_received:
+        update_data["completed_at"] = datetime.now(timezone.utc).isoformat()
+        update_data["pipeline_paused"] = False
+
+    client.table("zo_founder_actions").update(update_data).eq("action_id", action_id).execute()
+
+    if all_received:
+        return (
+            f"✅ {key} saved for {action['product_name']}.\n"
+            f"✅ All {len(required_keys)} values received!\n\n"
+            f"🚀 Resuming pipeline. {action['product_name']} continuing..."
+        )
+    else:
+        return (
+            f"✅ {key} saved for {action['product_name']}.\n"
+            f"Remaining: {len(remaining)} of {len(required_keys)} — {', '.join(remaining)}"
+        )
+
+
+async def _cmd_actions() -> str:
+    """Show all pending founder actions across all products."""
+    client = db.get_client()
+    actions = client.table("zo_founder_actions").select("*").in_("status", ["pending", "partial"]).order("created_at").execute().data
+
+    if not actions:
+        return "✅ No pending founder actions.\nAll products running autonomously."
+
+    msg = f"📋 PENDING FOUNDER ACTIONS ({len(actions)})\n\n"
+    for a in actions:
+        items = a.get("items", [])
+        received = a.get("items_received", {})
+        if isinstance(items, str):
+            items = json.loads(items)
+        if isinstance(received, str):
+            received = json.loads(received)
+        total = len([i for i in items if i.get("required", True)])
+        done = len(received)
+        urgency_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(a.get("urgency", "medium"), "🟡")
+
+        msg += f"{a['action_id']} | {a['product_name']} | {urgency_emoji} {a.get('urgency', 'medium').upper()}\n"
+        msg += f"  Need: {', '.join(i['key'] for i in items if i.get('required', True))}\n"
+        msg += f"  Status: {done} of {total} provided\n\n"
+
+    msg += "Reply: /config FA-xxx KEY=VALUE\nOr: /skip FA-xxx SERVICE_NAME"
+    return msg
+
+
+async def _cmd_skip(args: str) -> str:
+    """Skip a founder action — launch without that feature."""
+    parts = args.split(None, 1)
+    action_id = parts[0].upper() if parts else ""
+    service = parts[1] if len(parts) > 1 else ""
+
+    client = db.get_client()
+    result = client.table("zo_founder_actions").select("*").eq("action_id", action_id).execute()
+    if not result.data:
+        return f"No action found with ID {action_id}. Type /actions to see pending."
+
+    action = result.data[0]
+    consequence = action.get("skip_consequence", "Feature will be unavailable")
+
+    client.table("zo_founder_actions").update({
+        "status": "skipped",
+        "pipeline_paused": False,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }).eq("action_id", action_id).execute()
+
+    return (
+        f"⚠️ {action['product_name']} will launch WITHOUT {service or 'this feature'}.\n"
+        f"Consequence: {consequence}\n\n"
+        f"🚀 Resuming pipeline.\n"
+        f"You can add this later with /config {action_id} KEY=VALUE"
+    )
+
+
+async def create_founder_action(project_id: str, product_name: str, items: list, how_to_get: str, **kwargs) -> str:
+    """Create a founder action and notify via Telegram."""
+    client = db.get_client()
+
+    # Generate action ID
+    existing = client.table("zo_founder_actions").select("action_id").order("created_at", desc=True).limit(1).execute()
+    last_num = 0
+    if existing.data:
+        try:
+            last_num = int(existing.data[0]["action_id"].replace("FA-", ""))
+        except Exception:
+            pass
+    action_id = f"FA-{last_num + 1:03d}"
+
+    action = {
+        "action_id": action_id,
+        "project_id": project_id,
+        "product_name": product_name,
+        "action_type": kwargs.get("action_type", "credential"),
+        "urgency": kwargs.get("urgency", "medium"),
+        "status": "pending",
+        "items": json.dumps(items),
+        "items_received": json.dumps({}),
+        "how_to_get": how_to_get,
+        "cost_estimate": kwargs.get("cost_estimate"),
+        "service_url": kwargs.get("service_url"),
+        "pipeline_paused": kwargs.get("pipeline_paused", True),
+        "pipeline_stage": kwargs.get("pipeline_stage", "launch"),
+        "can_skip": kwargs.get("can_skip", True),
+        "skip_consequence": kwargs.get("skip_consequence"),
+    }
+
+    client.table("zo_founder_actions").insert(action).execute()
+
+    # Send Telegram notification
+    import httpx
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
+
+    items_list = "\n".join(f"  {i+1}. {item['key']} — {item.get('description', '')}" for i, item in enumerate(items))
+    config_examples = "\n".join(f"/config {action_id} {item['key']}=<value>" for item in items)
+
+    urgency_emoji = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "🟢"}.get(kwargs.get("urgency", "medium"), "🟡")
+
+    msg = (
+        f"🔧 FOUNDER ACTION REQUIRED\n\n"
+        f"Product: {product_name}\n"
+        f"Action ID: {action_id}\n"
+        f"Urgency: {urgency_emoji} {kwargs.get('urgency', 'medium').upper()}\n\n"
+        f"━━━ WHAT I NEED ━━━\n{items_list}\n\n"
+        f"━━━ HOW TO GET IT ━━━\n{how_to_get}\n\n"
+        f"━━━ REPLY WITH ━━━\n{config_examples}\n"
+    )
+    if kwargs.get("can_skip", True):
+        msg += f"\nOr: /skip {action_id} (launches without this feature)"
+
+    try:
+        async with httpx.AsyncClient() as http:
+            await http.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                json={"chat_id": CHAT_ID, "text": msg[:4000]},
+                timeout=10,
+            )
+    except Exception as e:
+        logger.error("Failed to send founder action notification: %s", e)
+
+    return action_id
 
 
 async def _cmd_pause() -> str:
