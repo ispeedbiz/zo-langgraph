@@ -7,6 +7,7 @@ v2.1 — Graphs wired. Every handler executes real LangGraph agents.
 """
 
 import asyncio
+import json
 import logging
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks
@@ -19,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.8.0",
+    version="2.8.1",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.8.0",
+        "version": "2.8.1",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -796,31 +797,115 @@ async def _cmd_costs() -> str:
 async def _cmd_review(args: str) -> str:
     client = db.get_client()
     if args:
+        # Full research brief for a specific product
         projects = client.table("zo_projects").select("name,status,approval,research_score,metadata").ilike("name", args).execute().data
-        reviews = client.table("ethics_reviews").select("idea_name,verdict,ethical_score,concerns,reasoning").ilike("idea_name", args).execute().data
+        reviews = client.table("ethics_reviews").select("idea_name,verdict,ethical_score,concerns,reasoning,required_fixes").ilike("idea_name", args).execute().data
+
+        # Also get the research data from pipeline_events
+        events = client.table("pipeline_events").select("payload,created_at").eq("event_type", "evaluation_complete").order("created_at", desc=True).limit(5).execute().data
+
         p = projects[0] if projects else None
         r = reviews[0] if reviews else None
         if not p:
             return f'No project named "{args}". Type /projects to see all.'
-        msg = f"{p['name']} — Full Review\n\nResearch Score: {p.get('research_score', '?')}\n"
+
+        # Extract research details from pipeline_events payload
+        idea_detail = {}
+        for e in events:
+            payload = e["payload"] if isinstance(e["payload"], dict) else json.loads(e["payload"])
+            evals = payload.get("all_evaluations", payload.get("go_evaluations", []))
+            for ev in evals:
+                if (ev.get("name") or "").lower() == args.lower():
+                    idea_detail = ev
+                    break
+            if idea_detail:
+                break
+
+        # Also check metadata for research details
+        meta = p.get("metadata", {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+
+        msg = f"━━━ {p['name']} ━━━\n\n"
+
+        # Problem & Solution (from pipeline_events or metadata)
+        problem = idea_detail.get("problem") or meta.get("description", "")
+        audience = idea_detail.get("audience") or idea_detail.get("who_suffers") or meta.get("target_audience", "")
+        solution = idea_detail.get("solution") or idea_detail.get("proposed_solution", "")
+        category = idea_detail.get("category") or p.get("category", "")
+        price = idea_detail.get("price_point") or idea_detail.get("monthly_price", "")
+        revenue_model = idea_detail.get("revenue_model") or idea_detail.get("monetization", "")
+        tier = idea_detail.get("product_tier") or idea_detail.get("tier") or meta.get("tier", "?")
+
+        if problem:
+            msg += f"PROBLEM:\n{problem[:200]}\n\n"
+        if audience:
+            msg += f"WHO SUFFERS:\n{audience[:150]}\n\n"
+        if solution:
+            msg += f"SOLUTION:\n{solution[:200]}\n\n"
+        if category:
+            msg += f"Category: {category}\n"
+        if price:
+            msg += f"Price: {price}\n"
+        if revenue_model:
+            msg += f"Revenue: {revenue_model}\n"
+        msg += f"Tier: {tier}\n"
+
+        # Scores
+        msg += f"\nResearch Score: {p.get('research_score', '?')}\n"
+        ws = idea_detail.get("weighted_score", "")
+        if ws:
+            msg += f"Weighted Score: {ws}\n"
+
+        # Ethics
         if r:
-            msg += f"Ethics Score: {r['ethical_score']}\nVerdict: {r['verdict']}\n\nReasoning:\n{(r.get('reasoning') or '')[:300]}\n"
+            msg += f"\nEthics: {r['ethical_score']} — {r['verdict']}\n"
+            if r.get("reasoning"):
+                msg += f"{(r['reasoning'])[:250]}\n"
             concerns = r.get("concerns", [])
             if isinstance(concerns, str):
-                import json as _j
-                concerns = _j.loads(concerns)
+                concerns = json.loads(concerns)
             if concerns:
-                msg += f"\nConcerns:\n" + "\n".join(f"• {c}" for c in concerns) + "\n"
+                msg += "\nConcerns:\n" + "\n".join(f"• {c}" for c in concerns[:5]) + "\n"
+            fixes = r.get("required_fixes", [])
+            if isinstance(fixes, str):
+                fixes = json.loads(fixes)
+            if fixes:
+                msg += "\nRequired Fixes:\n" + "\n".join(f"• {f}" for f in fixes[:5]) + "\n"
+
         msg += f"\n/approve {p['name']} or /reject {p['name']} [reason]"
-        return msg
+
+        # Truncate for Telegram 4096 limit
+        return msg[:3900]
     else:
-        pending = client.table("zo_projects").select("name,research_score").eq("status", "pending_approval").order("research_score", desc=True).execute().data
+        # List mode — show summary with problem statement
+        pending = client.table("zo_projects").select("name,research_score,metadata").eq("status", "pending_approval").order("research_score", desc=True).execute().data
         if not pending:
             return "No projects pending your review.\n\nAll Tier 1-2 products are auto-approved."
+        # Get ethics reasoning for each
+        reviews = client.table("ethics_reviews").select("idea_name,ethical_score,reasoning").execute().data
+        review_map = {r["idea_name"].lower(): r for r in reviews if r.get("idea_name")}
+
         msg = f"Pending Your Review ({len(pending)})\n\n"
         for i, p in enumerate(pending):
+            meta = p.get("metadata", {})
+            if isinstance(meta, str):
+                try: meta = json.loads(meta)
+                except: meta = {}
+            desc = meta.get("description", "")[:100]
+            r = review_map.get(p["name"].lower(), {})
+            reasoning = (r.get("reasoning") or "")[:80]
+
             msg += f"{i+1}. {p['name']} ({p.get('research_score', '?')})\n"
-        msg += "\n/approve [name] or /reject [name] [reason]"
+            if desc:
+                msg += f"   {desc}\n"
+            if reasoning:
+                msg += f"   Ethics: \"{reasoning}\"\n"
+            msg += "\n"
+        msg += "Type /review [name] for full details\n/approve [name] or /reject [name] [reason]"
         return msg
 
 
@@ -854,9 +939,14 @@ async def _cmd_ideas() -> str:
     if not events:
         return "No research runs found. Type /research to trigger one."
     e = events[0]
-    payload = e["payload"] if isinstance(e["payload"], dict) else __import__("json").loads(e["payload"])
-    import math
-    ago = math.ceil(((__import__("datetime").datetime.now(__import__("datetime").timezone.utc) - __import__("dateutil.parser").parse(e["created_at"])).total_seconds()) / 60)
+    payload = e["payload"] if isinstance(e["payload"], dict) else json.loads(e["payload"])
+    # Calculate time ago without dateutil
+    from datetime import datetime, timezone
+    try:
+        created = datetime.fromisoformat(e["created_at"].replace("Z", "+00:00"))
+        ago = max(1, int((datetime.now(timezone.utc) - created).total_seconds() / 60))
+    except Exception:
+        ago = "?"
 
     evals = payload.get("all_evaluations", payload.get("go_evaluations", []))
     go_names = payload.get("go_ideas", [])
