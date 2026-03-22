@@ -19,7 +19,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.7.0",
+    version="2.8.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -60,7 +60,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.7.0",
+        "version": "2.8.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -641,3 +641,268 @@ async def start_research_pipeline(background_tasks: BackgroundTasks):
     event = await db.emit_event("research_trigger", None, "api", {})
     background_tasks.add_task(_run_handler_safe, _handle_research_trigger, None, {}, event["id"])
     return {"status": "accepted", "event_id": event["id"], "pipeline": "research → evaluation → ethics → approve"}
+
+
+# ── Telegram Command Handlers (H-031) ───────────────────
+
+@app.post("/telegram/commands")
+async def handle_telegram_command_v2(req: dict):
+    """Handle ALL Telegram commands from Bridge Mind.
+
+    n8n sends: {command: "/status", args: "", chat_id: "xxx"}
+    This returns: {text: "formatted response"}
+    """
+    command = (req.get("command", "") or "").strip().lower().replace("/", "")
+    args = (req.get("args", "") or "").strip()
+
+    try:
+        if command == "help" or command == "start":
+            return {"text": _cmd_help()}
+        elif command == "status":
+            return {"text": await _cmd_status()}
+        elif command == "projects":
+            return {"text": await _cmd_projects()}
+        elif command == "costs":
+            return {"text": await _cmd_costs()}
+        elif command == "review":
+            return {"text": await _cmd_review(args)}
+        elif command == "ethics":
+            return {"text": await _cmd_ethics()}
+        elif command == "ideas":
+            return {"text": await _cmd_ideas()}
+        elif command == "approve" and args:
+            return {"text": await _cmd_approve(args)}
+        elif command == "reject" and args:
+            return {"text": await _cmd_reject(args)}
+        elif command == "pause":
+            return {"text": await _cmd_pause()}
+        elif command == "resume":
+            return {"text": await _cmd_resume()}
+        elif command == "build" and args:
+            return {"text": await _cmd_build(args)}
+        else:
+            return {"text": f"Unknown command: /{command}\nType /help for available commands."}
+    except Exception as e:
+        logger.error("Telegram command error: %s", e, exc_info=True)
+        return {"text": f"Error: {str(e)[:200]}\n\nTry /help for commands."}
+
+
+def _cmd_help() -> str:
+    return """ZeroOrigine Commands
+
+INFO:
+/status — Ecosystem overview
+/projects — List all projects
+/ideas — Latest research output
+/ethics — Ethics review summary
+/costs — API spend breakdown
+
+ACTIONS:
+/research — Trigger research (~$0.45)
+/review — Pending founder reviews
+/approve [name] — Approve a project
+/reject [name] [reason] — Reject
+/build [name] — Start building
+
+CONTROLS:
+/health — System health
+/pause — Emergency stop
+/resume — Restart ecosystem"""
+
+
+async def _cmd_status() -> str:
+    client = db.get_client()
+    projects = client.table("zo_projects").select("name,status,approval").neq("project_id", "zo-test-ping").neq("project_id", "zo-test-dbwrite").execute().data
+    costs = client.table("zo_cost_logs").select("cost_usd").execute().data
+    today = __import__("datetime").date.today().isoformat()
+    today_costs = client.table("zo_cost_logs").select("cost_usd").gte("created_at", today).execute().data
+
+    by_status = {}
+    pending_names = []
+    for p in projects:
+        by_status[p["status"]] = by_status.get(p["status"], 0) + 1
+        if p["status"] == "pending_approval":
+            pending_names.append(p["name"])
+
+    total = sum(float(c.get("cost_usd", 0) or 0) for c in costs)
+    today_total = sum(float(c.get("cost_usd", 0) or 0) for c in today_costs)
+
+    pending_line = f"Pending: {', '.join(pending_names)}\nType /review for details" if pending_names else "No pending reviews"
+
+    return f"""ZeroOrigine Status
+
+Projects: {len(projects)} total
+  {by_status.get('approved', 0)} approved
+  {by_status.get('pending_approval', 0)} pending review
+  {by_status.get('building', 0)} building
+  {by_status.get('live', 0)} live
+
+Cost: ${today_total:.2f} today | ${total:.2f} total
+
+{pending_line}"""
+
+
+async def _cmd_projects() -> str:
+    client = db.get_client()
+    projects = client.table("zo_projects").select("name,status,approval,research_score").neq("project_id", "zo-test-ping").neq("project_id", "zo-test-dbwrite").order("created_at", desc=True).execute().data
+
+    approved = [p for p in projects if p["status"] == "approved"]
+    pending = [p for p in projects if p["status"] == "pending_approval"]
+    other = [p for p in projects if p["status"] not in ("approved", "pending_approval")]
+
+    msg = f"ZO Projects ({len(projects)})\n"
+    if approved:
+        msg += "\nAPPROVED:\n"
+        for p in approved:
+            msg += f"  {p['name']} — {p.get('research_score', '?')} ({p.get('approval', 'auto')})\n"
+    if pending:
+        msg += "\nPENDING FOUNDER:\n"
+        for p in pending:
+            msg += f"  {p['name']} — {p.get('research_score', '?')}\n"
+    if other:
+        msg += "\nOTHER:\n"
+        for p in other:
+            msg += f"  {p['name']} — {p['status']}\n"
+    return msg
+
+
+async def _cmd_costs() -> str:
+    client = db.get_client()
+    costs = client.table("zo_cost_logs").select("mind,cost_usd,created_at").order("created_at", desc=True).execute().data
+    today = __import__("datetime").date.today().isoformat()
+
+    today_by_mind, total_by_mind = {}, {}
+    today_total, grand_total = 0, 0
+
+    for c in costs:
+        cost = float(c.get("cost_usd", 0) or 0)
+        mind = c.get("mind", "unknown")
+        total_by_mind[mind] = total_by_mind.get(mind, 0) + cost
+        grand_total += cost
+        if c.get("created_at", "").startswith(today):
+            today_by_mind[mind] = today_by_mind.get(mind, 0) + cost
+            today_total += cost
+
+    msg = f"API Cost Report\n\nToday (${today_total:.2f}):\n"
+    for m, c in sorted(today_by_mind.items(), key=lambda x: -x[1]):
+        msg += f"  {m}: ${c:.2f}\n"
+    msg += f"\nAll Time (${grand_total:.2f}):\n"
+    for m, c in sorted(total_by_mind.items(), key=lambda x: -x[1]):
+        msg += f"  {m}: ${c:.2f}\n"
+    msg += "\nBudget: $587.39 variable/month"
+    return msg
+
+
+async def _cmd_review(args: str) -> str:
+    client = db.get_client()
+    if args:
+        projects = client.table("zo_projects").select("name,status,approval,research_score,metadata").ilike("name", args).execute().data
+        reviews = client.table("ethics_reviews").select("idea_name,verdict,ethical_score,concerns,reasoning").ilike("idea_name", args).execute().data
+        p = projects[0] if projects else None
+        r = reviews[0] if reviews else None
+        if not p:
+            return f'No project named "{args}". Type /projects to see all.'
+        msg = f"{p['name']} — Full Review\n\nResearch Score: {p.get('research_score', '?')}\n"
+        if r:
+            msg += f"Ethics Score: {r['ethical_score']}\nVerdict: {r['verdict']}\n\nReasoning:\n{(r.get('reasoning') or '')[:300]}\n"
+            concerns = r.get("concerns", [])
+            if isinstance(concerns, str):
+                import json as _j
+                concerns = _j.loads(concerns)
+            if concerns:
+                msg += f"\nConcerns:\n" + "\n".join(f"• {c}" for c in concerns) + "\n"
+        msg += f"\n/approve {p['name']} or /reject {p['name']} [reason]"
+        return msg
+    else:
+        pending = client.table("zo_projects").select("name,research_score").eq("status", "pending_approval").order("research_score", desc=True).execute().data
+        if not pending:
+            return "No projects pending your review.\n\nAll Tier 1-2 products are auto-approved."
+        msg = f"Pending Your Review ({len(pending)})\n\n"
+        for i, p in enumerate(pending):
+            msg += f"{i+1}. {p['name']} ({p.get('research_score', '?')})\n"
+        msg += "\n/approve [name] or /reject [name] [reason]"
+        return msg
+
+
+async def _cmd_ethics() -> str:
+    client = db.get_client()
+    reviews = client.table("ethics_reviews").select("idea_name,verdict,ethical_score,reasoning").neq("idea_name", "DB Write Test").order("reviewed_at", desc=True).limit(10).execute().data
+
+    approved = [r for r in reviews if r["verdict"] == "APPROVED"]
+    fixes = [r for r in reviews if r["verdict"] == "NEEDS_FIXES"]
+    blocked = [r for r in reviews if r["verdict"] == "BLOCKED"]
+
+    msg = f"Ethics Reviews ({len(reviews)})\n"
+    if approved:
+        msg += "\nAPPROVED:\n"
+        for r in approved:
+            msg += f"  {r['idea_name']} {r['ethical_score']} — \"{(r.get('reasoning') or '')[:50]}\"\n"
+    if fixes:
+        msg += "\nNEEDS FIXES:\n"
+        for r in fixes:
+            msg += f"  {r['idea_name']} {r['ethical_score']}\n"
+    if blocked:
+        msg += "\nBLOCKED:\n"
+        for r in blocked:
+            msg += f"  {r['idea_name']} {r['ethical_score']}\n"
+    return msg
+
+
+async def _cmd_ideas() -> str:
+    client = db.get_client()
+    events = client.table("pipeline_events").select("payload,created_at").eq("event_type", "evaluation_complete").order("created_at", desc=True).limit(1).execute().data
+    if not events:
+        return "No research runs found. Type /research to trigger one."
+    e = events[0]
+    payload = e["payload"] if isinstance(e["payload"], dict) else __import__("json").loads(e["payload"])
+    import math
+    ago = math.ceil(((__import__("datetime").datetime.now(__import__("datetime").timezone.utc) - __import__("dateutil.parser").parse(e["created_at"])).total_seconds()) / 60)
+
+    evals = payload.get("all_evaluations", payload.get("go_evaluations", []))
+    go_names = payload.get("go_ideas", [])
+
+    msg = f"Latest Research ({ago}m ago)\n\n{payload.get('total_ideas', '?')} ideas, {len(go_names)} GO:\n\n"
+    for ev in evals:
+        is_go = ev.get("name") in go_names
+        msg += f"{'✅' if is_go else '❌'} {ev.get('name', '?')} — {ev.get('weighted_score', '?')}\n"
+    msg += "\nType /research for new run (~$0.45)"
+    return msg
+
+
+async def _cmd_approve(name: str) -> str:
+    client = db.get_client()
+    result = client.table("zo_projects").update({"status": "approved", "approval": "FOUNDER_APPROVED"}).ilike("name", name).eq("status", "pending_approval").execute()
+    if result.data:
+        return f"✅ {result.data[0]['name']} APPROVED by founder.\nProject moves to Builder queue."
+    return f'No pending project named "{name}". Type /review to see pending.'
+
+
+async def _cmd_reject(args: str) -> str:
+    parts = args.split(None, 1)
+    name = parts[0]
+    reason = parts[1] if len(parts) > 1 else "No reason provided"
+    client = db.get_client()
+    result = client.table("zo_projects").update({"status": "rejected", "approval": "FOUNDER_REJECTED"}).ilike("name", name).eq("status", "pending_approval").execute()
+    if result.data:
+        return f"❌ {result.data[0]['name']} REJECTED.\nReason: {reason}"
+    return f'No pending project named "{name}".'
+
+
+async def _cmd_pause() -> str:
+    client = db.get_client()
+    client.table("zo_config").update({"value": "true"}).eq("key", "ECOSYSTEM_PAUSE").execute()
+    return "⛔ ECOSYSTEM PAUSED\n\nAll pipeline activity stopped.\nType /resume to restart."
+
+
+async def _cmd_resume() -> str:
+    client = db.get_client()
+    client.table("zo_config").update({"value": "false"}).eq("key", "ECOSYSTEM_PAUSE").execute()
+    return "▶️ ECOSYSTEM RESUMED\n\nPipeline activity restored."
+
+
+async def _cmd_build(name: str) -> str:
+    client = db.get_client()
+    projects = client.table("zo_projects").select("project_id,name,status,research_score").ilike("name", name).eq("status", "approved").execute().data
+    if not projects:
+        return f'No approved project named "{name}". Type /projects to see available.'
+    return f"🔨 Builder Mind not yet activated.\n\n\"{projects[0]['name']}\" is approved and ready.\nBuilder pipeline coming soon."
