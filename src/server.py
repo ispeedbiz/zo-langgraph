@@ -20,7 +20,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="2.8.1",
+    version="2.9.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -61,7 +61,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "2.8.1",
+        "version": "2.9.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing"],
         "ecosystem_status": ecosystem_status,
     }
@@ -439,6 +439,13 @@ async def _handle_research_trigger(project_id: str | None, payload: dict) -> dic
             logger.info(f"Created project: {project_id} (pending approval)")
         except Exception as e:
             logger.error(f"Failed to create project {project_id}: {e}")
+
+    # === Auto-trigger Builder Mind for auto-approved products ===
+    for idea in auto_approved_list:
+        idea_name = idea.get("name", "unknown")
+        project_id = f"zo-{idea_name.lower().replace(' ', '-').replace('/', '-')}"
+        logger.info("Auto-triggering Builder Mind for %s (%s)", idea_name, project_id)
+        asyncio.create_task(_run_builder_safe(project_id, idea_name))
 
     logger.info(
         "═══ PIPELINE COMPLETE: %d auto-approved, %d pending, %d blocked, cost $%.4f ═══",
@@ -992,7 +999,83 @@ async def _cmd_resume() -> str:
 
 async def _cmd_build(name: str) -> str:
     client = db.get_client()
-    projects = client.table("zo_projects").select("project_id,name,status,research_score").ilike("name", name).eq("status", "approved").execute().data
+    projects = client.table("zo_projects").select("project_id,name,status,research_score,category").ilike("name", name).execute().data
     if not projects:
-        return f'No approved project named "{name}". Type /projects to see available.'
-    return f"🔨 Builder Mind not yet activated.\n\n\"{projects[0]['name']}\" is approved and ready.\nBuilder pipeline coming soon."
+        return f'No project named "{name}". Type /projects to see available.'
+
+    p = projects[0]
+    if p["status"] == "building":
+        return f'🔨 {p["name"]} is already being built.'
+    if p["status"] not in ("approved", "pending_approval"):
+        return f'{p["name"]} status is "{p["status"]}". Only approved projects can be built.'
+
+    # Update status to building
+    client.table("zo_projects").update({"status": "building"}).eq("project_id", p["project_id"]).execute()
+
+    # Trigger builder in background
+    project_id = p["project_id"]
+    asyncio.create_task(_run_builder_safe(project_id, p["name"]))
+
+    return f"🔨 Builder Mind activated for {p['name']}!\n\nScore: {p.get('research_score', '?')} | Category: {p.get('category', '?')}\nBuilding started... 5 Builder Minds working.\n\nYou'll get a notification when complete."
+
+
+async def _run_builder_safe(project_id: str, product_name: str):
+    """Run Builder Mind in background with error handling and Telegram notification."""
+    import httpx
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
+
+    async def notify(text: str):
+        try:
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": text},
+                    timeout=10,
+                )
+        except Exception as e:
+            logger.error("Failed to send Telegram notification: %s", e)
+
+    try:
+        logger.info("Builder Mind starting for %s (%s)", product_name, project_id)
+        state = await run_builder(project_id=project_id)
+
+        if state.get("error"):
+            # Build failed
+            db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
+            await notify(f"❌ Build FAILED for {product_name}\n\nError: {str(state['error'])[:200]}\n\nProject status set to build_failed.")
+            logger.error("Builder failed for %s: %s", product_name, state["error"])
+        else:
+            # Build succeeded
+            db.get_client().table("zo_projects").update({"status": "build_complete"}).eq("project_id", project_id).execute()
+            cost = state.get("total_cost_usd", 0)
+            await notify(
+                f"✅ Build COMPLETE for {product_name}!\n\n"
+                f"Cost: ${cost:.2f}\n"
+                f"5 components generated:\n"
+                f"  • Database schema\n"
+                f"  • API endpoints\n"
+                f"  • Core features\n"
+                f"  • Auth + payments\n"
+                f"  • Landing page\n\n"
+                f"QA pipeline will start automatically."
+            )
+            logger.info("Builder completed for %s. Cost: $%.2f", product_name, cost)
+
+            # Trigger QA automatically
+            try:
+                qa_state = await run_qa(project_id=project_id)
+                if qa_state.get("passed"):
+                    db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
+                    await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
+                else:
+                    db.get_client().table("zo_projects").update({"status": "qa_failed"}).eq("project_id", project_id).execute()
+                    await notify(f"⚠️ QA needs fixes for {product_name}\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
+            except Exception as qa_err:
+                logger.error("QA failed for %s: %s", product_name, qa_err)
+                await notify(f"⚠️ QA error for {product_name}: {str(qa_err)[:150]}")
+
+    except Exception as e:
+        logger.error("Builder Mind crashed for %s: %s", product_name, e, exc_info=True)
+        db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
+        await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}")
