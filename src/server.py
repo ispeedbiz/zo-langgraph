@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.0",
+    version="3.9.1",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -78,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.0",
+        "version": "3.9.1",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1162,7 +1162,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.0)\n"
+        f"Railway: OK (v3.9.1)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1475,10 +1475,18 @@ async def _run_builder_safe(project_id: str, product_name: str):
             logger.error("Failed to send Telegram notification: %s", e)
 
     async def heartbeat(stage: str):
-        """Update project status with current stage so we know where it is."""
+        """Update project status with current stage — MERGE with existing metadata."""
         try:
+            # Load existing metadata first so we don't overwrite code_for_qa
+            existing = db.get_client().table("zo_projects").select("metadata").eq("project_id", project_id).execute()
+            meta = {}
+            if existing.data:
+                raw = existing.data[0].get("metadata", "{}")
+                meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            meta["build_stage"] = stage
+            meta["heartbeat"] = datetime.now(timezone.utc).isoformat()
             db.get_client().table("zo_projects").update({
-                "metadata": json.dumps({"build_stage": stage, "heartbeat": datetime.now(timezone.utc).isoformat()}),
+                "metadata": json.dumps(meta),
             }).eq("project_id", project_id).execute()
         except Exception:
             pass
