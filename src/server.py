@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.5",
+    version="3.9.6",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -99,6 +99,8 @@ async def debug_qa_dry_run(project_id: str):
         "code_for_qa_sizes": {k: len(v) for k, v in code_for_qa.items()} if isinstance(code_for_qa, dict) else {},
         "code_for_qa_preview": {k: v[:100] + "..." for k, v in code_for_qa.items()} if isinstance(code_for_qa, dict) else {},
         "total_code_chars": sum(len(v) for v in code_for_qa.values()) if isinstance(code_for_qa, dict) else 0,
+        "qa_raw_response": (metadata.get("qa_raw_response", "not_captured_yet") or "")[:500] if isinstance(metadata, dict) else "no_metadata",
+        "qa_response_length": metadata.get("qa_response_length", 0) if isinstance(metadata, dict) else 0,
     }
 
 
@@ -113,7 +115,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.5",
+        "version": "3.9.6",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1205,7 +1207,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.5)\n"
+        f"Railway: OK (v3.9.6)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"

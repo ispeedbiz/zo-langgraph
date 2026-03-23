@@ -426,22 +426,36 @@ async def _run_tests(state: QAState) -> QAState:
 
     accumulate_cost(state, response)
 
+    # DIAGNOSTIC: Save raw QA response to project metadata so we can inspect it
+    try:
+        raw_content = response["content"][:2000]
+        db.get_client().table("zo_projects").update({
+            "metadata": {
+                **(state["project"].get("metadata") if isinstance(state["project"].get("metadata"), dict) else {}),
+                "qa_raw_response": raw_content,
+                "qa_response_length": len(response["content"]),
+            }
+        }).eq("project_id", state["project_id"]).execute()
+    except Exception:
+        pass
+
     parsed = extract_json(response["content"])
     if not parsed:
-        logger.error("QA test response was not valid JSON, marking as failed")
+        logger.error("QA test response was not valid JSON, marking as failed. First 500 chars: %s", response["content"][:500])
         state["test_results"] = {}
         state["overall_score"] = 0
         state["passed"] = False
-        state["error"] = "QA response parsing failed"
+        state["error"] = f"QA response parsing failed. Response starts with: {response['content'][:200]}"
         state["status"] = "parse_error"
         return state
 
-    state["test_results"] = parsed.get("test_results", {})
+    state["test_results"] = parsed.get("test_results", parsed)  # If parsed IS the test_results
     state["max_score"] = MAX_SCORE
 
-    # B-020-v5: QA Mind nests overall_score inside test_results, not at top level.
-    # Try top-level first, then test_results, then sum categories as last resort.
+    # B-020-v5: QA Mind returns scores in many formats. Try ALL of them.
     raw_score = parsed.get("overall_score")
+    if not raw_score:
+        raw_score = parsed.get("test_results", {}).get("overall_score") if isinstance(parsed.get("test_results"), dict) else None
     if not raw_score:
         raw_score = state["test_results"].get("overall_score")
     if not raw_score:
