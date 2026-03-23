@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.8.0",
+    version="3.8.1",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -78,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.8.0",
+        "version": "3.8.1",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1162,7 +1162,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.8.0)\n"
+        f"Railway: OK (v3.8.1)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1551,11 +1551,20 @@ async def _run_builder_safe(project_id: str, product_name: str):
             # Load QA context from the pipeline manifest
             qa_context = manifest.get("qa_context")
 
-            # Trigger QA automatically with pipeline context
+            # B-020: Extract build artifacts for QA code review
+            code_for_qa = {
+                "schema_sql": (state.get("schema_sql", "") or "")[:3000],
+                "api_code": (state.get("api_code", "") or "")[:3000],
+                "core_code": (state.get("core_code", "") or "")[:3000],
+                "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
+                "landing_page": (state.get("landing_page", "") or "")[:3000],
+            }
+
+            # Trigger QA automatically with pipeline context + build artifacts
             try:
                 await heartbeat("qa")
                 qa_state = await asyncio.wait_for(
-                    run_qa(project_id=project_id, qa_context=qa_context),
+                    run_qa(project_id=project_id, qa_context=qa_context, build_artifacts=code_for_qa),
                     timeout=BUILD_TIMEOUT,
                 )
                 if qa_state.get("passed"):
@@ -1596,12 +1605,18 @@ async def _run_builder_safe(project_id: str, product_name: str):
                 await notify(f"⚠️ QA error for {product_name}: {str(qa_err)[:150]}")
 
     except asyncio.TimeoutError:
+        import traceback
         logger.error("Builder Mind TIMED OUT for %s after %ds", product_name, BUILD_TIMEOUT)
         db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
+        global _last_pipeline_error
+        _last_pipeline_error = {"stage": "builder_timeout", "error": f"Timed out after {BUILD_TIMEOUT}s", "project": product_name, "timestamp": str(datetime.now(timezone.utc))}
         await notify(f"⏰ Build TIMED OUT for {product_name} (>{BUILD_TIMEOUT}s)\n\nUse /rebuild {product_name} to retry.")
     except Exception as e:
-        logger.error("Builder Mind crashed for %s: %s", product_name, e, exc_info=True)
+        import traceback
+        tb = traceback.format_exc()
+        logger.error("Builder Mind crashed for %s: %s\n%s", product_name, e, tb)
         db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
+        _last_pipeline_error = {"stage": "builder_crash", "error": str(e)[:500], "traceback": tb[:1000], "project": product_name, "timestamp": str(datetime.now(timezone.utc))}
         await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}\n\nUse /rebuild {product_name} to retry.")
 
 
