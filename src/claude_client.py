@@ -22,7 +22,7 @@ class ClaudeClient:
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(
             api_key=config.anthropic_api_key,
-            timeout=300.0,  # 5 min max per API call — prevent infinite hangs
+            timeout=600.0,  # 10 min per API call — Builder steps with 20K+ tokens need time
         )
 
     async def call(

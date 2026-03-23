@@ -1618,9 +1618,23 @@ Only include patches for components that need fixing. Leave others as empty stri
 async def _run_builder_safe(project_id: str, product_name: str):
     """Run Builder Mind in background with timeout, heartbeat, and error recovery."""
     import httpx
-    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
-    CHAT_ID = "8685703404"
-    BUILD_TIMEOUT = 600  # 10 minutes max per step
+    BOT_TOKEN = config.telegram_bot_token
+    CHAT_ID = config.telegram_chat_id
+    # Dynamic timeout based on product tier — Freedom principle: no artificial ceilings
+    # Micro-SaaS: 6 steps × ~90s = ~9min, with buffer → 15 min
+    # Standard SaaS: 6 steps × ~120s + QA rounds → 30 min
+    # Enterprise: 6 steps × ~180s + 3 QA rounds → 45 min
+    TIER_TIMEOUTS = {"micro-saas": 900, "standard": 1800, "enterprise": 2700}
+    DEFAULT_TIMEOUT = 1800  # 30 minutes — generous default
+
+    # Determine tier from project data
+    try:
+        _proj = db.get_client().table("zo_projects").select("tier,metadata").eq("project_id", project_id).execute()
+        _tier = (_proj.data[0].get("tier") or "standard").lower().replace(" ", "-") if _proj.data else "standard"
+    except Exception:
+        _tier = "standard"
+    BUILD_TIMEOUT = TIER_TIMEOUTS.get(_tier, DEFAULT_TIMEOUT)
+    logger.info("Build timeout for %s (%s tier): %ds", product_name, _tier, BUILD_TIMEOUT)
 
     async def notify(text: str):
         try:
@@ -2281,8 +2295,8 @@ async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
     """Run Hotfix pipeline in background with Telegram notification."""
     import httpx as _httpx
     import os
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
-    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+    BOT_TOKEN = config.telegram_bot_token
+    CHAT_ID = config.telegram_chat_id
 
     async def notify(text: str):
         try:
@@ -2453,8 +2467,8 @@ async def _process_donation(session: dict):
     # Send Telegram notification
     import httpx
     import os
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
-    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+    BOT_TOKEN = config.telegram_bot_token
+    CHAT_ID = config.telegram_chat_id
     new_label = "NEW MEMBER!" if is_new else "Returning supporter"
     try:
         async with httpx.AsyncClient() as http:

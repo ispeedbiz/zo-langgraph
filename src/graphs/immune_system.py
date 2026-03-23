@@ -198,8 +198,8 @@ async def run_health_check(project_id: str) -> dict:
 async def _send_health_alert(product_name: str, score: int, error: str | None, url: str):
     """Send Telegram alert for critical health issues."""
     import os
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
-    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     text = (
         f"🚨 HEALTH ALERT: {product_name}\n\n"
@@ -605,8 +605,8 @@ async def run_lifecycle_check(project_id: str) -> dict:
 async def _send_sunset_alert(product_name: str, avg_score: float, uptime_pct: float):
     """Notify founder about sunset candidate."""
     import os
-    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s")
-    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "8685703404")
+    BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
     text = (
         f"🌅 SUNSET CANDIDATE: {product_name}\n\n"
