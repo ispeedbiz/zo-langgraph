@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.3",
+    version="3.9.4",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -67,6 +67,41 @@ class ManualTriggerRequest(BaseModel):
     config_overrides: dict[str, Any] = {}
 
 
+# ── Diagnostics ────────────────────────────────────────
+
+@app.get("/debug/qa-dry-run/{project_id}")
+async def debug_qa_dry_run(project_id: str):
+    """Show exactly what QA would receive — $0 cost, no Claude call."""
+    project = await db.get_project(project_id)
+    if not project:
+        return {"error": f"Project {project_id} not found"}
+
+    metadata = project.get("metadata", {})
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except:
+            metadata = {}
+
+    code_for_qa = metadata.get("code_for_qa", {}) if isinstance(metadata, dict) else {}
+    deploy_url = project.get("deploy_url", "") or project.get("netlify_url", "")
+    is_code_review = not deploy_url or deploy_url.strip() == ""
+
+    return {
+        "project_id": project_id,
+        "name": project.get("name", "?"),
+        "status": project.get("status", "?"),
+        "deploy_url": deploy_url,
+        "is_code_review": is_code_review,
+        "metadata_type": type(project.get("metadata")).__name__,
+        "metadata_keys": list(metadata.keys()) if isinstance(metadata, dict) else "not_a_dict",
+        "code_for_qa_keys": list(code_for_qa.keys()) if isinstance(code_for_qa, dict) else "not_a_dict",
+        "code_for_qa_sizes": {k: len(v) for k, v in code_for_qa.items()} if isinstance(code_for_qa, dict) else {},
+        "code_for_qa_preview": {k: v[:100] + "..." for k, v in code_for_qa.items()} if isinstance(code_for_qa, dict) else {},
+        "total_code_chars": sum(len(v) for v in code_for_qa.values()) if isinstance(code_for_qa, dict) else 0,
+    }
+
+
 # ── Health ──────────────────────────────────────────────
 
 @app.get("/health")
@@ -78,7 +113,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.3",
+        "version": "3.9.4",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1170,7 +1205,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.3)\n"
+        f"Railway: OK (v3.9.4)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
