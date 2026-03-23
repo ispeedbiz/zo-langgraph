@@ -23,7 +23,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="4.0.0",
+    version="4.0.1",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -116,7 +116,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "4.0.0",
+        "version": "4.0.1",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1208,7 +1208,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v4.0.0)\n"
+        f"Railway: OK (v4.0.1)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1587,8 +1587,31 @@ async def _run_builder_safe(project_id: str, product_name: str):
             await notify(f"❌ Build FAILED for {product_name}\n\nError: {str(state['error'])[:200]}\n\nProject status set to build_failed.")
             logger.error("Builder failed for %s: %s", product_name, state["error"])
         else:
-            # Build succeeded
-            db.get_client().table("zo_projects").update({"status": "build_complete"}).eq("project_id", project_id).execute()
+            # Build succeeded — save FULL code for deploy (not truncated like code_for_qa)
+            try:
+                full_deploy_code = {
+                    "schema_sql": state.get("schema_sql", "") or "",
+                    "api_code": state.get("api_code", "") or "",
+                    "core_code": state.get("core_code", "") or "",
+                    "auth_payments_code": state.get("auth_payments_code", "") or "",
+                    "landing_page": state.get("landing_page", "") or "",
+                }
+                # Merge into existing metadata (don't overwrite code_for_qa)
+                existing = db.get_client().table("zo_projects").select("metadata").eq("project_id", project_id).execute()
+                meta = (existing.data[0].get("metadata") or {}) if existing.data else {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                meta["deploy_artifacts"] = full_deploy_code
+                db.get_client().table("zo_projects").update({
+                    "status": "build_complete",
+                    "metadata": meta,
+                }).eq("project_id", project_id).execute()
+                total_deploy_chars = sum(len(v) for v in full_deploy_code.values())
+                logger.info("Full deploy artifacts saved: %d total chars across 5 components", total_deploy_chars)
+            except Exception as save_err:
+                logger.error("Failed to save deploy artifacts: %s", save_err)
+                db.get_client().table("zo_projects").update({"status": "build_complete"}).eq("project_id", project_id).execute()
+
             cost = state.get("total_cost_usd", 0)
             await notify(
                 f"✅ Build COMPLETE for {product_name}!\n\n"
@@ -1797,42 +1820,59 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
             # ── Step 2: Wait for repo to be ready ─────────────────────
             await asyncio.sleep(5)
 
-            # ── Step 3: Load full build artifacts from checkpoint ──────
-            logger.info("Loading build artifacts from builder checkpoint for %s", project_id)
+            # ── Step 3: Load full build artifacts ──────────────────────
+            # B-021 fix: Priority order: deploy_artifacts (full) → checkpoint → code_for_qa (truncated)
+            logger.info("Loading build artifacts for %s", project_id)
             code_artifacts = {}
+            artifact_keys = ("schema_sql", "api_code", "core_code", "auth_payments_code", "landing_page")
+
+            # Source 1: deploy_artifacts in metadata (full non-truncated code)
             try:
-                checkpoint = client.table("agent_state").select("state_data").eq(
-                    "project_id", project_id
-                ).eq("graph_name", "builder").order("created_at", desc=True).limit(1).execute()
+                meta = project.get("metadata") or {}
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                deploy_arts = meta.get("deploy_artifacts", {})
+                if isinstance(deploy_arts, str):
+                    deploy_arts = json.loads(deploy_arts)
+                if deploy_arts and isinstance(deploy_arts, dict):
+                    for key in artifact_keys:
+                        if deploy_arts.get(key) and len(deploy_arts[key]) > 100:
+                            code_artifacts[key] = deploy_arts[key]
+                    if code_artifacts:
+                        total_chars = sum(len(v) for v in code_artifacts.values())
+                        logger.info("B-021: Loaded %d artifacts from deploy_artifacts (%d chars)", len(code_artifacts), total_chars)
+            except Exception as da_err:
+                logger.warning("B-021: Could not load deploy_artifacts: %s", da_err)
 
-                if checkpoint.data and checkpoint.data[0].get("state_data"):
-                    state_data = checkpoint.data[0]["state_data"]
-                    # state_data may be a string or dict
-                    if isinstance(state_data, str):
-                        state_data = json.loads(state_data)
-                    for key in ("schema_sql", "api_code", "core_code", "auth_payments_code", "landing_page"):
-                        if state_data.get(key):
-                            code_artifacts[key] = state_data[key]
-                    logger.info("Loaded %d artifacts from builder checkpoint (keys: %s)",
-                                len(code_artifacts), list(code_artifacts.keys()))
-                else:
-                    logger.warning("No builder checkpoint found — falling back to metadata")
-            except Exception as cp_err:
-                logger.warning("Could not load builder checkpoint: %s — falling back to metadata", cp_err)
-
-            # Fallback: use truncated code_for_qa from zo_projects.metadata
-            if not code_artifacts:
+            # Source 2: builder checkpoint
+            if len(code_artifacts) < 3:
                 try:
-                    meta = project.get("metadata") or {}
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    checkpoint = client.table("agent_state").select("state_data").eq(
+                        "project_id", project_id
+                    ).eq("graph_name", "builder").order("created_at", desc=True).limit(1).execute()
+                    if checkpoint.data and checkpoint.data[0].get("state_data"):
+                        state_data = checkpoint.data[0]["state_data"]
+                        if isinstance(state_data, str):
+                            state_data = json.loads(state_data)
+                        for key in artifact_keys:
+                            if key not in code_artifacts and state_data.get(key) and len(state_data[key]) > 100:
+                                code_artifacts[key] = state_data[key]
+                        logger.info("After checkpoint: %d artifacts (keys: %s)", len(code_artifacts), list(code_artifacts.keys()))
+                except Exception as cp_err:
+                    logger.warning("Could not load builder checkpoint: %s", cp_err)
+
+            # Source 3: code_for_qa (truncated — last resort)
+            if len(code_artifacts) < 3:
+                try:
                     code_for_qa = meta.get("code_for_qa", {})
-                    for key in ("schema_sql", "api_code", "core_code", "auth_payments_code", "landing_page"):
-                        if code_for_qa.get(key):
+                    if isinstance(code_for_qa, str):
+                        code_for_qa = json.loads(code_for_qa)
+                    for key in artifact_keys:
+                        if key not in code_artifacts and code_for_qa.get(key):
                             code_artifacts[key] = code_for_qa[key]
-                    logger.info("Loaded %d artifacts from metadata fallback", len(code_artifacts))
+                    logger.info("After code_for_qa fallback: %d artifacts", len(code_artifacts))
                 except Exception as meta_err:
-                    logger.warning("Could not load artifacts from metadata: %s", meta_err)
+                    logger.warning("Could not load code_for_qa: %s", meta_err)
 
             if not code_artifacts:
                 return {"success": False, "error": "No build artifacts found in checkpoint or metadata"}
@@ -1862,13 +1902,26 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
                     logger.warning("Failed to push %s: %s", file_path, err)
 
             # Push JSON-encoded code artifacts (api_code, core_code, etc.)
+            def _strip_markdown_fences(text: str) -> str:
+                """Strip markdown code fences that Builder wraps around JSON."""
+                text = text.strip()
+                if text.startswith("```"):
+                    # Remove opening fence (```json or ```)
+                    first_newline = text.find("\n")
+                    if first_newline > 0:
+                        text = text[first_newline + 1:]
+                if text.endswith("```"):
+                    text = text[:-3].rstrip()
+                return text
+
             json_artifacts = ["api_code", "core_code", "auth_payments_code", "landing_page"]
             for artifact_key in json_artifacts:
                 raw = code_artifacts.get(artifact_key)
                 if not raw:
                     continue
                 try:
-                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    clean = _strip_markdown_fences(raw) if isinstance(raw, str) else raw
+                    parsed = json.loads(clean) if isinstance(clean, str) else clean
                     if isinstance(parsed, dict):
                         for file_path, file_content in parsed.items():
                             # Clean file path — remove leading slash if present
@@ -1894,11 +1947,25 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
             # Push schema_sql as a migration file (raw SQL, not JSON)
             schema_sql = code_artifacts.get("schema_sql")
             if schema_sql:
-                await _push_file(
-                    "supabase/migrations/001_schema.sql",
-                    schema_sql,
-                    "feat: database schema migration",
-                )
+                # Strip markdown fences if present
+                schema_sql = _strip_markdown_fences(schema_sql)
+                # schema_sql might also be JSON-wrapped like {"schema.sql": "content"}
+                try:
+                    parsed_schema = json.loads(schema_sql)
+                    if isinstance(parsed_schema, dict):
+                        for fpath, content in parsed_schema.items():
+                            clean_path = fpath.lstrip("/")
+                            if not clean_path.startswith("supabase"):
+                                clean_path = f"supabase/migrations/{clean_path}"
+                            await _push_file(clean_path, content, f"feat: {clean_path} [schema]")
+                    else:
+                        await _push_file("supabase/migrations/001_schema.sql", schema_sql, "feat: database schema migration")
+                except (json.JSONDecodeError, TypeError):
+                    await _push_file(
+                        "supabase/migrations/001_schema.sql",
+                        schema_sql,
+                        "feat: database schema migration",
+                    )
 
             logger.info("Pushed %d files to %s (%d errors)", files_pushed, repo_full_name, len(push_errors))
 
