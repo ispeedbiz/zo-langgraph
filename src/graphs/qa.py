@@ -437,9 +437,29 @@ async def _run_tests(state: QAState) -> QAState:
         return state
 
     state["test_results"] = parsed.get("test_results", {})
-    state["overall_score"] = parsed.get("overall_score", 0)
     state["max_score"] = MAX_SCORE
+
+    # B-020-v5: QA Mind nests overall_score inside test_results, not at top level.
+    # Try top-level first, then test_results, then sum categories as last resort.
+    raw_score = parsed.get("overall_score")
+    if not raw_score:
+        raw_score = state["test_results"].get("overall_score")
+    if not raw_score:
+        # Sum individual category scores as fallback
+        cats = state["test_results"].get("categories", state["test_results"].get("category_scores", {}))
+        if cats and isinstance(cats, dict):
+            raw_score = sum(
+                c.get("score", 0) for c in cats.values() if isinstance(c, dict)
+            )
+            logger.info("QA score computed from category sum: %d", raw_score)
+    state["overall_score"] = raw_score or 0
     state["passed"] = parsed.get("passed", False)
+
+    logger.info("B-020-v5: QA score resolved — %d/%d (top=%s, nested=%s, summed=%s)",
+                state["overall_score"], MAX_SCORE,
+                parsed.get("overall_score"),
+                state["test_results"].get("overall_score"),
+                "fallback" if not parsed.get("overall_score") and not state["test_results"].get("overall_score") else "no")
 
     # Override pass/fail with our own threshold check
     threshold = state.get("pass_threshold", DEFAULT_PASS_THRESHOLD)
