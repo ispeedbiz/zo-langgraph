@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.2",
+    version="3.9.3",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -78,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.2",
+        "version": "3.9.3",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -583,23 +583,31 @@ async def _handle_build_complete(project_id: str | None, payload: dict) -> dict:
     except Exception as e:
         logger.warning("Failed to load pipeline manifest for QA context: %s", e)
 
-    # B-020 Fix 2: Pass actual build artifacts to QA for code review
-    code_for_qa = payload.get("code_for_qa", {})
-    if not code_for_qa:
-        # Try loading from builder checkpoint
-        try:
-            checkpoint = await db.get_latest_checkpoint(project_id, "builder")
-            if checkpoint:
-                sd = checkpoint.get("state_data", {})
-                code_for_qa = {
-                    "schema_sql": (sd.get("schema_sql", "") or "")[:3000],
-                    "api_code": (sd.get("api_code", "") or "")[:3000],
-                    "core_code": (sd.get("core_code", "") or "")[:3000],
-                    "auth_payments_code": (sd.get("auth_payments_code", "") or "")[:3000],
-                    "landing_page": (sd.get("landing_page", "") or "")[:3000],
-                }
-        except Exception as e:
-            logger.warning("Could not load builder checkpoint for QA: %s", e)
+    # B-020 Fix v4: Load code_for_qa directly from zo_projects.metadata
+    # Builder saves code there (emit_result line 886). Event payload is intentionally
+    # small (under 8KB for pg_net), so code is NOT in the payload. Checkpoint fallback
+    # also fails because builder doesn't save full code to checkpoints.
+    # The ONLY reliable source is the database.
+    code_for_qa = {}
+    try:
+        proj_row = db.get_client().table("zo_projects").select("metadata").eq(
+            "project_id", project_id
+        ).execute()
+        if proj_row.data:
+            meta = proj_row.data[0].get("metadata") or {}
+            if isinstance(meta, str):
+                import json as _json
+                meta = _json.loads(meta)
+            if isinstance(meta, dict):
+                code_for_qa = meta.get("code_for_qa", {})
+        non_empty = sum(1 for v in code_for_qa.values() if v and v.strip()) if code_for_qa else 0
+        total_chars = sum(len(v) for v in code_for_qa.values() if v) if code_for_qa else 0
+        logger.info(
+            "B-020-v4: Loaded code_for_qa from DB for %s — %d components with content, %d total chars",
+            project_id, non_empty, total_chars,
+        )
+    except Exception as e:
+        logger.error("B-020-v4: Failed to load code_for_qa from DB for %s: %s", project_id, e)
 
     state = await run_qa(project_id=project_id, qa_context=qa_context, build_artifacts=code_for_qa)
     return {
@@ -1162,7 +1170,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.2)\n"
+        f"Railway: OK (v3.9.3)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
