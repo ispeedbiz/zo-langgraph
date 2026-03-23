@@ -27,7 +27,28 @@ from .shared import BuildState, extract_json, accumulate_cost, OUTPUT_JSON_INSTR
 logger = logging.getLogger("zo.graphs.builder")
 
 GRAPH_NAME = "builder"
-TOTAL_STEPS = 5
+TOTAL_STEPS = 6  # 5 build steps + 1 self-validation
+
+# Token budget — no artificial ceiling. Builder gets room proportional to complexity.
+# Tier mapping: micro-saas = lean, standard = full, enterprise = generous.
+TIER_TOKEN_BUDGET = {
+    "micro-saas": 12000,   # Simple tools — fewer features, fewer files
+    "standard": 20000,     # Full SaaS — CRUD, payments, dashboards, auth
+    "enterprise": 32000,   # Complex products — multi-entity, workflows, integrations
+}
+DEFAULT_TOKEN_BUDGET = 20000  # When tier is unknown, don't restrict
+
+
+def _get_token_budget(state: dict) -> int:
+    """Let the product's complexity decide the Builder's creative freedom."""
+    # 1. If Pipeline Architect specified a budget, respect it
+    build_ctx = state.get("build_context") or {}
+    if build_ctx.get("token_budget"):
+        return int(build_ctx["token_budget"])
+    # 2. Otherwise, derive from product tier
+    project = state.get("project", {})
+    tier = (project.get("tier") or project.get("product_tier") or "standard").lower().replace(" ", "-")
+    return TIER_TOKEN_BUDGET.get(tier, DEFAULT_TOKEN_BUDGET)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -78,11 +99,11 @@ async def _save_step_checkpoint(
         node_name=node_name,
         step_number=step_number,
         state_data={
-            "schema_sql": (state.get("schema_sql", "") or "")[:4000],
-            "api_code": (state.get("api_code", "") or "")[:4000],
-            "core_code": (state.get("core_code", "") or "")[:4000],
-            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:4000],
-            "landing_page": (state.get("landing_page", "") or "")[:4000],
+            "schema_sql": state.get("schema_sql", "") or "",
+            "api_code": state.get("api_code", "") or "",
+            "core_code": state.get("core_code", "") or "",
+            "auth_payments_code": state.get("auth_payments_code", "") or "",
+            "landing_page": state.get("landing_page", "") or "",
             "current_step": step_number,
             "total_tokens": state.get("total_tokens", 0),
             "total_cost_usd": state.get("total_cost_usd", 0),
@@ -297,11 +318,11 @@ YOUR TASK: Generate the core React components, pages, and state management.
 
 DATABASE SCHEMA (for reference -- match column names exactly):
 ```sql
-{schema_sql[:4000]}
+{schema_sql}
 ```
 
 API ROUTES (for reference -- call these endpoints):
-{api_code[:4000]}
+{api_code}
 
 REQUIREMENTS:
 
@@ -609,7 +630,7 @@ async def step_1_schema(state: BuildState) -> BuildState:
         user_message=user_msg,
         project_id=state["project_id"],
         workflow="builder",
-        max_tokens=8000,
+        max_tokens=_get_token_budget(state),
         temperature=0.2,
         extra_context=extra_ctx,
     )
@@ -649,7 +670,7 @@ async def step_2_api(state: BuildState) -> BuildState:
 
     user_msg = (
         f"Generate the API routes for {name}.\n\n"
-        f"The database schema is:\n```sql\n{state.get('schema_sql', 'NOT YET GENERATED')[:6000]}\n```\n\n"
+        f"The database schema is:\n```sql\n{state.get('schema_sql', 'NOT YET GENERATED')}\n```\n\n"
         f"Return a JSON object mapping file paths to file contents."
     )
 
@@ -659,7 +680,7 @@ async def step_2_api(state: BuildState) -> BuildState:
         user_message=user_msg,
         project_id=state["project_id"],
         workflow="builder",
-        max_tokens=8000,
+        max_tokens=_get_token_budget(state),
         temperature=0.2,
         extra_context=extra_ctx,
     )
@@ -713,7 +734,7 @@ async def step_3_core(state: BuildState) -> BuildState:
         user_message=user_msg,
         project_id=state["project_id"],
         workflow="builder",
-        max_tokens=8000,
+        max_tokens=_get_token_budget(state),
         temperature=0.3,
         extra_context=extra_ctx,
     )
@@ -753,7 +774,7 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
     user_msg = (
         f"Generate auth + Stripe payments for {name}.\n\n"
         f"Database schema (reference for table names):\n"
-        f"```sql\n{state.get('schema_sql', '')[:3000]}\n```\n\n"
+        f"```sql\n{state.get('schema_sql', '')}\n```\n\n"
         f"The pricing tiers should match what the product needs for {category}.\n"
         f"Return a JSON object mapping file paths to file contents."
     )
@@ -764,7 +785,7 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
         user_message=user_msg,
         project_id=state["project_id"],
         workflow="builder",
-        max_tokens=8000,
+        max_tokens=_get_token_budget(state),
         temperature=0.2,
         extra_context=extra_ctx,
     )
@@ -815,7 +836,7 @@ async def step_5_landing(state: BuildState) -> BuildState:
         user_message=user_msg,
         project_id=state["project_id"],
         workflow="builder",
-        max_tokens=8000,
+        max_tokens=_get_token_budget(state),
         temperature=0.4,
         extra_context=extra_ctx,
     )
@@ -831,6 +852,174 @@ async def step_5_landing(state: BuildState) -> BuildState:
     await _save_step_checkpoint(state, step, "step_5_landing")
 
     logger.info("Step 5 complete -- landing page generated (%d chars)", len(state["landing_page"]))
+    return state
+
+
+SELF_VALIDATION_PROMPT = """# Builder Self-Validation — Zero Compromise Quality Gate
+
+You are the SAME Builder Mind that just generated a complete SaaS product.
+Before your code reaches QA, you must validate it yourself. A craftsman inspects
+their own work before anyone else sees it.
+
+## YOUR CODE (review all 5 components below):
+
+### 1. Database Schema
+```sql
+{schema_sql}
+```
+
+### 2. API Routes
+{api_code}
+
+### 3. Core Components
+{core_code}
+
+### 4. Auth + Payments
+{auth_payments_code}
+
+### 5. Landing Page
+{landing_page}
+
+## VALIDATION CHECKLIST — Every item must be YES
+
+### Security (CRITICAL — no product ships without these)
+- [ ] RLS policies defined for EVERY table (not just created, but with policies)
+- [ ] Input validation on ALL API routes (zod, yup, or manual checks)
+- [ ] No hardcoded API keys or secrets
+- [ ] Auth middleware on protected routes
+- [ ] CORS configuration present
+
+### Functionality (CRITICAL — core product must work)
+- [ ] ALL CRUD operations for primary entity (create, read, update, delete)
+- [ ] Stripe checkout session creation + webhook handler
+- [ ] User dashboard shows real data from database
+- [ ] Forms are wired to API endpoints (not just UI shells)
+- [ ] Error handling on every API route (try/catch, proper HTTP status codes)
+
+### Performance
+- [ ] Database indexes on foreign keys and frequently queried columns
+- [ ] Pagination on list endpoints (not fetching ALL rows)
+- [ ] Proper use of React Server Components (data fetching on server, not client)
+
+### Accessibility & Mobile
+- [ ] Viewport meta tag in layout
+- [ ] Semantic HTML (nav, main, article, section — not all divs)
+- [ ] ARIA labels on interactive elements (buttons, inputs, links)
+- [ ] Mobile-first responsive design (sm: md: lg: breakpoints)
+- [ ] Touch-friendly tap targets (min 44px)
+
+### Code Quality
+- [ ] TypeScript interfaces/types for all data models (NO implicit any)
+- [ ] Proper error boundaries at layout level
+- [ ] Environment variable validation
+- [ ] Clean imports (no unused)
+
+## YOUR TASK
+Review your generated code against this checklist. For each MISSING item, generate
+the PATCH CODE to fix it. Return a JSON object:
+
+```json
+{{
+  "validation_passed": true/false,
+  "gaps_found": ["gap 1 description", "gap 2 description"],
+  "patches": {{
+    "schema_sql_patch": "-- Additional SQL to append (RLS policies, indexes, etc.)",
+    "api_code_patch": {{"filepath": "code"}},
+    "core_code_patch": {{"filepath": "code"}},
+    "auth_payments_code_patch": {{"filepath": "code"}},
+    "landing_page_patch": {{"filepath": "code"}}
+  }},
+  "confidence_score": 0-100
+}}
+```
+
+If ALL items pass, set validation_passed=true, patches empty, confidence_score=95+.
+If gaps exist, generate REAL CODE patches (not descriptions). Be specific and complete.
+"""
+
+
+async def step_6_self_validate(state: BuildState) -> BuildState:
+    """Builder self-validation — inspect own code before QA sees it."""
+    step = 6
+    state["current_step"] = step
+    state["status"] = "building:self_validate"
+
+    project = state["project"]
+    name = project.get("product_name", project.get("name", "Untitled"))
+
+    prompt = SELF_VALIDATION_PROMPT.format(
+        schema_sql=state.get("schema_sql", "NOT GENERATED"),
+        api_code=state.get("api_code", "NOT GENERATED"),
+        core_code=state.get("core_code", "NOT GENERATED"),
+        auth_payments_code=state.get("auth_payments_code", "NOT GENERATED"),
+        landing_page=state.get("landing_page", "NOT GENERATED"),
+    )
+
+    response = await claude.call(
+        agent_name="builder",
+        system_prompt=f"You are the Builder Mind performing self-validation on {name}. Be ruthlessly honest.",
+        user_message=prompt,
+        project_id=state["project_id"],
+        workflow="builder",
+        max_tokens=_get_token_budget(state),
+        temperature=0.1,
+    )
+
+    state = accumulate_cost(state, response)
+
+    parsed = extract_json(response["content"])
+    if not parsed:
+        logger.warning("Self-validation response not JSON — skipping patches")
+        await _save_step_checkpoint(state, step, "step_6_self_validate")
+        return state
+
+    gaps = parsed.get("gaps_found", [])
+    confidence = parsed.get("confidence_score", 0)
+    patches = parsed.get("patches", {})
+
+    logger.info(
+        "Self-validation for %s: confidence=%d, gaps=%d, patches=%d",
+        name, confidence, len(gaps), sum(1 for v in patches.values() if v),
+    )
+
+    # Apply patches — append SQL, merge JSON file patches
+    if patches.get("schema_sql_patch"):
+        patch = patches["schema_sql_patch"]
+        if isinstance(patch, str) and patch.strip() and patch.strip() != "--":
+            state["schema_sql"] = (state.get("schema_sql", "") or "") + "\n\n-- Self-validation patches\n" + patch
+            logger.info("Applied schema_sql patch (%d chars)", len(patch))
+
+    for key in ("api_code", "core_code", "auth_payments_code", "landing_page"):
+        patch_key = f"{key}_patch"
+        patch = patches.get(patch_key)
+        if not patch:
+            continue
+        if isinstance(patch, dict) and patch:
+            # Merge patched files into existing code
+            try:
+                existing = json.loads(state.get(key, "{}")) if isinstance(state.get(key), str) else state.get(key, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.update(patch)
+                state[key] = json.dumps(existing, indent=2)
+                logger.info("Applied %s patch (%d files)", key, len(patch))
+            except (json.JSONDecodeError, TypeError):
+                # Can't merge — append as new JSON
+                state[key] = json.dumps(patch, indent=2)
+                logger.warning("Replaced %s with patch (couldn't merge)", key)
+        elif isinstance(patch, str) and patch.strip():
+            state[key] = (state.get(key, "") or "") + "\n" + patch
+
+    state["self_validation"] = {
+        "confidence_score": confidence,
+        "gaps_found": gaps,
+        "patches_applied": sum(1 for v in patches.values() if v),
+    }
+
+    await _save_step_checkpoint(state, step, "step_6_self_validate")
+
+    logger.info("Step 6 complete — self-validation done (confidence: %d, gaps patched: %d)",
+                confidence, sum(1 for v in patches.values() if v))
     return state
 
 
@@ -877,11 +1066,11 @@ async def emit_result(state: BuildState) -> BuildState:
     # pg_net has 8KB limit on webhook payloads — code would exceed it
     try:
         code_for_qa = {
-            "schema_sql": (state.get("schema_sql", "") or "")[:6000],
-            "api_code": (state.get("api_code", "") or "")[:6000],
-            "core_code": (state.get("core_code", "") or "")[:6000],
-            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:6000],
-            "landing_page": (state.get("landing_page", "") or "")[:6000],
+            "schema_sql": state.get("schema_sql", "") or "",
+            "api_code": state.get("api_code", "") or "",
+            "core_code": state.get("core_code", "") or "",
+            "auth_payments_code": state.get("auth_payments_code", "") or "",
+            "landing_page": state.get("landing_page", "") or "",
         }
         # Pass dict directly — Supabase client handles JSON serialization
         # DO NOT use json.dumps() — causes double-serialization
@@ -947,6 +1136,7 @@ def _build_graph(resume_from: int | None = None) -> StateGraph:
     graph.add_node("step_3_core", step_3_core)
     graph.add_node("step_4_auth_payments", step_4_auth_payments)
     graph.add_node("step_5_landing", step_5_landing)
+    graph.add_node("step_6_self_validate", step_6_self_validate)
     graph.add_node("collect_outputs", collect_outputs)
     graph.add_node("emit_result", emit_result)
 
@@ -976,7 +1166,8 @@ def _build_graph(resume_from: int | None = None) -> StateGraph:
     graph.add_edge("step_2_api", "step_3_core")
     graph.add_edge("step_3_core", "step_4_auth_payments")
     graph.add_edge("step_4_auth_payments", "step_5_landing")
-    graph.add_edge("step_5_landing", "collect_outputs")
+    graph.add_edge("step_5_landing", "step_6_self_validate")
+    graph.add_edge("step_6_self_validate", "collect_outputs")
     graph.add_edge("collect_outputs", "emit_result")
     graph.add_edge("emit_result", END)
 

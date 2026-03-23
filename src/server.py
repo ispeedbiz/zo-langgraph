@@ -1502,6 +1502,119 @@ async def _cmd_build(name: str) -> str:
     return f"🔨 Builder Mind activated for {p['name']}!\n\nScore: {p.get('research_score', '?')} | Category: {p.get('category', '?')}\nBuilding started... 5 Builder Minds working.\n\nYou'll get a notification when complete."
 
 
+MAX_QA_ROUNDS = 3  # Max Builder↔QA feedback loops before accepting or escalating
+
+
+async def _builder_patch_from_qa(project_id: str, product_name: str, failing_categories: list) -> dict:
+    """Builder patches specific weak categories identified by QA. Returns updated code_for_qa."""
+    from .claude_client import claude
+
+    # Load current code from metadata
+    client = db.get_client()
+    proj = client.table("zo_projects").select("metadata").eq("project_id", project_id).execute()
+    if not proj.data:
+        return {}
+    meta = proj.data[0].get("metadata") or {}
+    if isinstance(meta, str):
+        meta = json.loads(meta)
+    code = meta.get("deploy_artifacts") or meta.get("code_for_qa") or {}
+    if isinstance(code, str):
+        code = json.loads(code)
+
+    # Build a targeted patch prompt from QA's category failures
+    failure_report = []
+    for fc in failing_categories:
+        issues_str = "\n".join(f"  - {iss}" for iss in fc.get("issues", []))
+        failure_report.append(
+            f"### {fc['category'].upper()} — {fc['score']}/{fc['max']} ({fc['percentage']}%%, needs {fc['needed']})\n{issues_str}"
+        )
+    failures_text = "\n\n".join(failure_report)
+
+    patch_prompt = f"""# Builder Patch — QA Feedback Round
+
+QA Mind reviewed your code for {product_name} and found these categories below 70%:
+
+{failures_text}
+
+## YOUR CURRENT CODE:
+
+### Schema SQL
+```sql
+{code.get('schema_sql', 'N/A')}
+```
+
+### API Code
+{code.get('api_code', 'N/A')}
+
+### Core Code
+{code.get('core_code', 'N/A')}
+
+### Auth + Payments
+{code.get('auth_payments_code', 'N/A')}
+
+### Landing Page
+{code.get('landing_page', 'N/A')}
+
+## YOUR TASK:
+Generate TARGETED patches to fix ONLY the failing categories.
+Do NOT regenerate everything — just fix what QA flagged.
+
+Return JSON:
+```json
+{{
+  "schema_sql_patch": "-- SQL to APPEND (RLS policies, indexes, etc.)",
+  "api_code_patch": {{"filepath": "complete file content"}},
+  "core_code_patch": {{"filepath": "complete file content"}},
+  "auth_payments_code_patch": {{"filepath": "complete file content"}},
+  "landing_page_patch": {{"filepath": "complete file content"}}
+}}
+```
+Only include patches for components that need fixing. Leave others as empty string or empty object.
+"""
+
+    response = await claude.call(
+        agent_name="builder",
+        system_prompt=f"You are the Builder Mind patching {product_name} based on QA feedback. Fix ONLY what's broken. Be surgical.",
+        user_message=patch_prompt,
+        project_id=project_id,
+        workflow="builder",
+        max_tokens=20000,
+        temperature=0.1,
+    )
+
+    from .graphs.shared import extract_json
+    parsed = extract_json(response["content"])
+    if not parsed:
+        logger.warning("Builder patch response not JSON — patch failed")
+        return code
+
+    # Apply patches to code
+    if parsed.get("schema_sql_patch") and isinstance(parsed["schema_sql_patch"], str) and parsed["schema_sql_patch"].strip():
+        code["schema_sql"] = (code.get("schema_sql", "") or "") + "\n\n-- QA feedback patches\n" + parsed["schema_sql_patch"]
+
+    for key in ("api_code", "core_code", "auth_payments_code", "landing_page"):
+        patch = parsed.get(f"{key}_patch")
+        if not patch:
+            continue
+        if isinstance(patch, dict) and patch:
+            try:
+                existing = json.loads(code.get(key, "{}")) if isinstance(code.get(key), str) else code.get(key, {})
+                if not isinstance(existing, dict):
+                    existing = {}
+                existing.update(patch)
+                code[key] = json.dumps(existing, indent=2)
+            except (json.JSONDecodeError, TypeError):
+                code[key] = json.dumps(patch, indent=2)
+
+    # Save patched code back to metadata
+    meta["code_for_qa"] = code
+    meta["deploy_artifacts"] = code
+    client.table("zo_projects").update({"metadata": meta}).eq("project_id", project_id).execute()
+    logger.info("Builder patch applied for %s — %d categories targeted", product_name, len(failing_categories))
+
+    return code
+
+
 async def _run_builder_safe(project_id: str, product_name: str):
     """Run Builder Mind in background with timeout, heartbeat, and error recovery."""
     import httpx
@@ -1645,49 +1758,105 @@ async def _run_builder_safe(project_id: str, product_name: str):
                 logger.warning("Could not load code_for_qa from metadata: %s", e)
                 code_for_qa = {}
 
-            # Trigger QA automatically with pipeline context + build artifacts
-            try:
-                await heartbeat("qa")
-                qa_state = await asyncio.wait_for(
-                    run_qa(project_id=project_id, qa_context=qa_context, build_artifacts=code_for_qa),
-                    timeout=BUILD_TIMEOUT,
-                )
-                if qa_state.get("passed"):
-                    db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
-                    await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}\n\n📢 Marketing Mind starting...")
+            # ── Autonomous Quality Loop: Builder↔QA feedback (max 3 rounds) ──
+            qa_passed = False
+            qa_round = 0
+            qa_state = {}
 
-                    # Trigger Marketing Mind automatically
-                    try:
-                        mkt_result = await _handle_qa_passed(project_id, {"product_name": product_name})
-                        await notify(f"📢 Marketing COMPLETE for {product_name}!\nCost: ${mkt_result.get('marketing_cost', 0):.2f}\n\n🚀 Deploying to Netlify...")
-                    except Exception as mkt_err:
-                        logger.error("Marketing failed for %s: %s", product_name, mkt_err)
-                        await notify(f"⚠️ Marketing error for {product_name}: {str(mkt_err)[:150]}\n\nProceeding to deploy anyway.")
+            while qa_round < MAX_QA_ROUNDS and not qa_passed:
+                qa_round += 1
+                try:
+                    await heartbeat("qa")
+                    logger.info("QA round %d/%d for %s", qa_round, MAX_QA_ROUNDS, product_name)
+                    db.get_client().table("zo_projects").update({"status": f"qa_round_{qa_round}"}).eq("project_id", project_id).execute()
 
-                    # H-049: Auto-deploy to Netlify
-                    try:
-                        deploy_result = await _auto_deploy_product(project_id, product_name)
-                        if deploy_result.get("success"):
-                            live_url = deploy_result.get("url", "")
+                    qa_state = await asyncio.wait_for(
+                        run_qa(project_id=project_id, qa_context=qa_context, build_artifacts=code_for_qa),
+                        timeout=BUILD_TIMEOUT,
+                    )
+
+                    if qa_state.get("passed"):
+                        qa_passed = True
+                        logger.info("QA PASSED on round %d for %s — score %s/%s",
+                                    qa_round, product_name, qa_state.get("overall_score"), qa_state.get("max_score", 140))
+                    else:
+                        failing_cats = qa_state.get("failing_categories", [])
+                        score = qa_state.get("overall_score", 0)
+                        cat_names = [fc["category"] for fc in failing_cats] if failing_cats else ["overall_threshold"]
+
+                        if qa_round < MAX_QA_ROUNDS:
                             await notify(
-                                f"🎉 {product_name} IS LIVE!\n\n"
-                                f"🔗 {live_url}\n\n"
-                                f"Built: ${cost:.2f}\n"
-                                f"QA Score: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}\n"
-                                f"Marketing: ready\n\n"
-                                f"Health monitoring starts automatically."
+                                f"🔄 QA Round {qa_round}/{MAX_QA_ROUNDS} for {product_name}\n"
+                                f"Score: {score}/{qa_state.get('max_score', 140)}\n"
+                                f"Weak: {', '.join(cat_names)}\n\n"
+                                f"Builder patching automatically..."
                             )
+                            # Builder patches the weak categories
+                            try:
+                                if failing_cats:
+                                    code_for_qa = await _builder_patch_from_qa(project_id, product_name, failing_cats)
+                                else:
+                                    logger.warning("QA failed but no category details — cannot target patch")
+                                    break
+                            except Exception as patch_err:
+                                logger.error("Builder patch failed for %s: %s", product_name, patch_err)
+                                break
                         else:
-                            await notify(f"⚠️ Deploy issue for {product_name}: {deploy_result.get('error', 'unknown')[:200]}\n\nProduct built + QA passed. Manual deploy may be needed.")
-                    except Exception as deploy_err:
-                        logger.error("Deploy failed for %s: %s", product_name, deploy_err)
-                        await notify(f"⚠️ Deploy error for {product_name}: {str(deploy_err)[:150]}\n\nProduct built + QA passed. Manual deploy needed.")
-                else:
-                    db.get_client().table("zo_projects").update({"status": "qa_failed"}).eq("project_id", project_id).execute()
-                    await notify(f"⚠️ QA needs fixes for {product_name}\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}")
-            except Exception as qa_err:
-                logger.error("QA failed for %s: %s", product_name, qa_err)
-                await notify(f"⚠️ QA error for {product_name}: {str(qa_err)[:150]}")
+                            logger.warning("QA still failing after %d rounds for %s — score %d", MAX_QA_ROUNDS, product_name, score)
+
+                except Exception as qa_err:
+                    logger.error("QA round %d error for %s: %s", qa_round, product_name, qa_err)
+                    await notify(f"⚠️ QA error (round {qa_round}) for {product_name}: {str(qa_err)[:150]}")
+                    break
+
+            # ── Post Quality Loop: proceed or stop ──
+            if qa_passed:
+                final_score = qa_state.get("overall_score", "?")
+                db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
+                await notify(
+                    f"✅ QA PASSED for {product_name}!\n"
+                    f"Score: {final_score}/{qa_state.get('max_score', 140)}"
+                    f"{f' (after {qa_round} rounds)' if qa_round > 1 else ''}\n"
+                    f"All categories ≥70%\n\n"
+                    f"📢 Marketing Mind starting..."
+                )
+
+                # Trigger Marketing Mind automatically
+                try:
+                    mkt_result = await _handle_qa_passed(project_id, {"product_name": product_name})
+                    await notify(f"📢 Marketing COMPLETE for {product_name}!\nCost: ${mkt_result.get('marketing_cost', 0):.2f}\n\n🚀 Deploying to Netlify...")
+                except Exception as mkt_err:
+                    logger.error("Marketing failed for %s: %s", product_name, mkt_err)
+                    await notify(f"⚠️ Marketing error for {product_name}: {str(mkt_err)[:150]}\n\nProceeding to deploy anyway.")
+
+                # H-049: Auto-deploy to Netlify
+                try:
+                    deploy_result = await _auto_deploy_product(project_id, product_name)
+                    if deploy_result.get("success"):
+                        live_url = deploy_result.get("url", "")
+                        await notify(
+                            f"🎉 {product_name} IS LIVE!\n\n"
+                            f"🔗 {live_url}\n\n"
+                            f"Built: ${cost:.2f}\n"
+                            f"QA Score: {final_score}/{qa_state.get('max_score', 140)} ({qa_round} round{'s' if qa_round > 1 else ''})\n"
+                            f"Marketing: ready\n\n"
+                            f"Health monitoring starts automatically."
+                        )
+                    else:
+                        await notify(f"⚠️ Deploy issue for {product_name}: {deploy_result.get('error', 'unknown')[:200]}\n\nProduct built + QA passed. Manual deploy may be needed.")
+                except Exception as deploy_err:
+                    logger.error("Deploy failed for %s: %s", product_name, deploy_err)
+                    await notify(f"⚠️ Deploy error for {product_name}: {str(deploy_err)[:150]}\n\nProduct built + QA passed. Manual deploy needed.")
+            else:
+                final_score = qa_state.get("overall_score", 0) if qa_state else 0
+                failing_cats = qa_state.get("failing_categories", []) if qa_state else []
+                db.get_client().table("zo_projects").update({"status": "qa_failed"}).eq("project_id", project_id).execute()
+                await notify(
+                    f"⚠️ QA FAILED for {product_name} after {qa_round} rounds\n"
+                    f"Score: {final_score}/{qa_state.get('max_score', 140) if qa_state else 140}\n"
+                    f"Weak categories: {', '.join(fc['category'] for fc in failing_cats) if failing_cats else 'unknown'}\n\n"
+                    f"Use /rebuild {product_name} to retry."
+                )
 
     except asyncio.TimeoutError:
         import traceback

@@ -21,9 +21,21 @@ logger = logging.getLogger("zo.graphs.qa")
 # ── Constants ────────────────────────────────────────────────
 
 DEFAULT_PASS_THRESHOLD = 100
-CODE_REVIEW_THRESHOLD = 35  # First-build threshold — code is truncated, QA scores conservatively
+CODE_REVIEW_THRESHOLD = 70  # Per-category: every category must hit 70% of its max
 MAX_SCORE = 140
 DEFAULT_MAX_ROUNDS = 3
+MIN_CATEGORY_PERCENTAGE = 70  # Zero compromise — no category below 70%
+
+# Category max scores for per-category gate
+CATEGORY_MAX_SCORES = {
+    "functionality": 25,
+    "security": 25,
+    "performance": 20,
+    "accessibility": 20,
+    "mobile": 20,
+    "seo": 15,
+    "code_quality": 15,
+}
 
 QA_CODE_REVIEW_PROMPT = """# QA Mind — Code Review Mode
 
@@ -475,16 +487,49 @@ async def _run_tests(state: QAState) -> QAState:
                 state["test_results"].get("overall_score"),
                 "fallback" if not parsed.get("overall_score") and not state["test_results"].get("overall_score") else "no")
 
-    # Override pass/fail with our own threshold check
+    # Override pass/fail with per-category 70% gate + overall threshold
     threshold = state.get("pass_threshold", DEFAULT_PASS_THRESHOLD)
     critical_failures = parsed.get("critical_failures", [])
     score = state["overall_score"]
+
+    # Per-category gate — EVERY category must independently hit 70%
+    cats = state["test_results"].get("categories", state["test_results"].get("category_scores", {}))
+    failing_categories = []
+    if cats and isinstance(cats, dict):
+        for cat_name, cat_data in cats.items():
+            if not isinstance(cat_data, dict):
+                continue
+            cat_score = cat_data.get("score", 0)
+            cat_max = cat_data.get("max_score", CATEGORY_MAX_SCORES.get(cat_name, 20))
+            cat_pct = (cat_score / cat_max * 100) if cat_max > 0 else 0
+            if cat_pct < MIN_CATEGORY_PERCENTAGE:
+                failing_categories.append({
+                    "category": cat_name,
+                    "score": cat_score,
+                    "max": cat_max,
+                    "percentage": round(cat_pct, 1),
+                    "needed": round(cat_max * MIN_CATEGORY_PERCENTAGE / 100),
+                    "issues": cat_data.get("issues", []),
+                })
+                logger.warning(
+                    "Category BELOW 70%%: %s = %d/%d (%.1f%%)",
+                    cat_name, cat_score, cat_max, cat_pct,
+                )
+
+    state["failing_categories"] = failing_categories
 
     if critical_failures:
         state["passed"] = False
         logger.warning(
             "QA FAILED: %d critical failures found: %s",
             len(critical_failures), critical_failures,
+        )
+    elif failing_categories:
+        state["passed"] = False
+        cat_names = [fc["category"] for fc in failing_categories]
+        logger.warning(
+            "QA FAILED: %d categories below 70%% — %s (overall %d/%d)",
+            len(failing_categories), cat_names, score, MAX_SCORE,
         )
     elif score < threshold:
         state["passed"] = False
@@ -494,7 +539,7 @@ async def _run_tests(state: QAState) -> QAState:
         )
     else:
         state["passed"] = True
-        logger.info("QA PASSED: score %d/%d (threshold %d)", score, MAX_SCORE, threshold)
+        logger.info("QA PASSED: score %d/%d (threshold %d, all categories ≥70%%)", score, MAX_SCORE, threshold)
 
     # Save checkpoint
     await db.save_checkpoint(
