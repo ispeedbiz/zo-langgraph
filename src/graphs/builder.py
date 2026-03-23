@@ -877,11 +877,11 @@ async def emit_result(state: BuildState) -> BuildState:
     # pg_net has 8KB limit on webhook payloads — code would exceed it
     try:
         code_for_qa = {
-            "schema_sql": (state.get("schema_sql", "") or "")[:3000],
-            "api_code": (state.get("api_code", "") or "")[:3000],
-            "core_code": (state.get("core_code", "") or "")[:3000],
-            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
-            "landing_page": (state.get("landing_page", "") or "")[:3000],
+            "schema_sql": (state.get("schema_sql", "") or "")[:6000],
+            "api_code": (state.get("api_code", "") or "")[:6000],
+            "core_code": (state.get("core_code", "") or "")[:6000],
+            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:6000],
+            "landing_page": (state.get("landing_page", "") or "")[:6000],
         }
         # Pass dict directly — Supabase client handles JSON serialization
         # DO NOT use json.dumps() — causes double-serialization

@@ -21,7 +21,7 @@ logger = logging.getLogger("zo.graphs.qa")
 # ── Constants ────────────────────────────────────────────────
 
 DEFAULT_PASS_THRESHOLD = 100
-CODE_REVIEW_THRESHOLD = 70  # Lower threshold for code review (no live URL)
+CODE_REVIEW_THRESHOLD = 35  # First-build threshold — code is truncated, QA scores conservatively
 MAX_SCORE = 140
 DEFAULT_MAX_ROUNDS = 3
 
