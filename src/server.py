@@ -7,6 +7,7 @@ v2.1 — Graphs wired. Every handler executes real LangGraph agents.
 """
 
 import asyncio
+import base64
 import json
 import logging
 import random
@@ -22,7 +23,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.7",
+    version="4.0.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -115,7 +116,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.7",
+        "version": "4.0.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1207,7 +1208,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.7)\n"
+        f"Railway: OK (v4.0.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1682,13 +1683,14 @@ async def _run_builder_safe(project_id: str, product_name: str):
 
 
 async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
-    """H-049: Auto-deploy a built product to Netlify.
+    """H-049: Auto-deploy a built product — GitHub repo + Netlify.
 
-    1. Create Netlify site from zo-saas-template
-    2. Configure env vars (Supabase, Stripe)
-    3. Set up subdomain DNS
-    4. Update zo_projects with live URL
-    5. Register with Health Pulse
+    1. Create GitHub repo from ZeroOrigine/zo-saas-template
+    2. Load full build artifacts from builder checkpoint
+    3. Push all code files to the new repo
+    4. Create Netlify site linked to the repo
+    5. Update zo_projects with live URL
+    6. Register with Health Pulse
     """
     import httpx
     import os
@@ -1699,39 +1701,212 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
         return {"success": False, "error": "Project not found"}
     project = project[0]
 
-    # Generate subdomain from product name
-    subdomain = product_name.lower().replace(" ", "").replace("-", "")
-    site_name = f"zo-{subdomain}"
+    # Generate slug from product name
+    slug = product_name.lower().replace(" ", "-").replace("_", "-")
+    # Remove non-alphanumeric chars except hyphens
+    slug = "".join(c for c in slug if c.isalnum() or c == "-").strip("-")
+    repo_name = f"zo-{slug}"
+    site_name = f"zo-{slug}"
+    subdomain = slug.replace("-", "")
     live_url = f"https://{subdomain}.zeroorigine.com"
 
-    logger.info("Auto-deploying %s to Netlify as %s", product_name, site_name)
+    logger.info("Auto-deploying %s → GitHub repo %s → Netlify %s", product_name, repo_name, site_name)
+
+    # ── Resolve tokens ────────────────────────────────────────────
+    def _get_token(env_key: str) -> str:
+        token = os.environ.get(env_key, "")
+        if not token:
+            try:
+                cfg = client.table("zo_config").select("value").eq("key", env_key).execute()
+                if cfg.data:
+                    token = cfg.data[0]["value"]
+            except Exception:
+                pass
+        return token
+
+    github_token = _get_token("GITHUB_TOKEN")
+    netlify_token = _get_token("NETLIFY_API_TOKEN")
+
+    # Check GitHub token — it's required for the new flow
+    if not github_token:
+        logger.warning("No GitHub token — creating founder action")
+        await create_founder_action(
+            project_id=project_id,
+            product_name=product_name,
+            items=[
+                {"key": "GITHUB_TOKEN", "description": "GitHub personal access token with repo scope", "required": True},
+            ],
+            how_to_get="Go to github.com → Settings → Developer settings → Personal access tokens → Generate (needs 'repo' scope)",
+            service_url="https://github.com/settings/tokens",
+            urgency="high",
+            pipeline_stage="launch",
+            can_skip=False,
+            skip_consequence="Cannot create repo — product stays in build_complete state",
+        )
+        return {"success": False, "error": "GitHub token needed — founder action created"}
+
+    if not netlify_token:
+        logger.warning("No Netlify token — creating founder action")
+        await create_founder_action(
+            project_id=project_id,
+            product_name=product_name,
+            items=[{"key": "NETLIFY_API_TOKEN", "description": "Netlify personal access token", "required": True}],
+            how_to_get="Go to app.netlify.com → User Settings → Applications → Personal access tokens → New token",
+            service_url="https://app.netlify.com/user/applications",
+            urgency="high",
+            pipeline_stage="launch",
+            can_skip=False,
+            skip_consequence="Cannot deploy — product stays in build_complete state",
+        )
+        return {"success": False, "error": "Netlify token needed — founder action created"}
+
+    github_headers = {
+        "Authorization": f"token {github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
 
     try:
         async with httpx.AsyncClient(timeout=60) as http:
-            netlify_token = os.environ.get("NETLIFY_API_TOKEN", "")
 
-            if not netlify_token:
-                # Try from zo_config
-                config = client.table("zo_config").select("value").eq("key", "NETLIFY_API_TOKEN").execute()
-                if config.data:
-                    netlify_token = config.data[0]["value"]
+            # ── Step 1: Create GitHub repo from template ──────────────
+            logger.info("Creating GitHub repo ZeroOrigine/%s from template", repo_name)
+            gen_resp = await http.post(
+                "https://api.github.com/repos/ZeroOrigine/zo-saas-template/generate",
+                headers={**github_headers, "Accept": "application/vnd.github.baptiste-preview+json"},
+                json={
+                    "owner": "ZeroOrigine",
+                    "name": repo_name,
+                    "private": False,
+                    "description": f"ZeroOrigine SaaS — {product_name} (auto-generated)",
+                },
+            )
 
-            if not netlify_token:
-                logger.warning("No Netlify token — creating founder action")
-                await create_founder_action(
-                    project_id=project_id,
-                    product_name=product_name,
-                    items=[{"key": "NETLIFY_API_TOKEN", "description": "Netlify personal access token", "required": True}],
-                    how_to_get="Go to app.netlify.com → User Settings → Applications → Personal access tokens → New token",
-                    service_url="https://app.netlify.com/user/applications",
-                    urgency="high",
-                    pipeline_stage="launch",
-                    can_skip=False,
-                    skip_consequence="Cannot deploy — product stays in build_complete state",
+            if gen_resp.status_code in (200, 201):
+                repo_data = gen_resp.json()
+                repo_full_name = repo_data.get("full_name", f"ZeroOrigine/{repo_name}")
+                logger.info("GitHub repo created: %s", repo_full_name)
+            elif gen_resp.status_code == 422 and "already exists" in gen_resp.text.lower():
+                # Repo already exists — reuse it
+                repo_full_name = f"ZeroOrigine/{repo_name}"
+                logger.info("GitHub repo already exists: %s — reusing", repo_full_name)
+            else:
+                error_msg = f"GitHub repo creation failed ({gen_resp.status_code}): {gen_resp.text[:300]}"
+                logger.error(error_msg)
+                return {"success": False, "error": error_msg}
+
+            # ── Step 2: Wait for repo to be ready ─────────────────────
+            await asyncio.sleep(5)
+
+            # ── Step 3: Load full build artifacts from checkpoint ──────
+            logger.info("Loading build artifacts from builder checkpoint for %s", project_id)
+            code_artifacts = {}
+            try:
+                checkpoint = client.table("agent_state").select("state_data").eq(
+                    "project_id", project_id
+                ).eq("graph_name", "builder").order("created_at", desc=True).limit(1).execute()
+
+                if checkpoint.data and checkpoint.data[0].get("state_data"):
+                    state_data = checkpoint.data[0]["state_data"]
+                    # state_data may be a string or dict
+                    if isinstance(state_data, str):
+                        state_data = json.loads(state_data)
+                    for key in ("schema_sql", "api_code", "core_code", "auth_payments_code", "landing_page"):
+                        if state_data.get(key):
+                            code_artifacts[key] = state_data[key]
+                    logger.info("Loaded %d artifacts from builder checkpoint (keys: %s)",
+                                len(code_artifacts), list(code_artifacts.keys()))
+                else:
+                    logger.warning("No builder checkpoint found — falling back to metadata")
+            except Exception as cp_err:
+                logger.warning("Could not load builder checkpoint: %s — falling back to metadata", cp_err)
+
+            # Fallback: use truncated code_for_qa from zo_projects.metadata
+            if not code_artifacts:
+                try:
+                    meta = project.get("metadata") or {}
+                    if isinstance(meta, str):
+                        meta = json.loads(meta)
+                    code_for_qa = meta.get("code_for_qa", {})
+                    for key in ("schema_sql", "api_code", "core_code", "auth_payments_code", "landing_page"):
+                        if code_for_qa.get(key):
+                            code_artifacts[key] = code_for_qa[key]
+                    logger.info("Loaded %d artifacts from metadata fallback", len(code_artifacts))
+                except Exception as meta_err:
+                    logger.warning("Could not load artifacts from metadata: %s", meta_err)
+
+            if not code_artifacts:
+                return {"success": False, "error": "No build artifacts found in checkpoint or metadata"}
+
+            # ── Step 4: Push files to GitHub ──────────────────────────
+            files_pushed = 0
+            push_errors = []
+
+            async def _push_file(file_path: str, content: str, msg: str):
+                """Push a single file to the GitHub repo."""
+                nonlocal files_pushed
+                encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+                resp = await http.put(
+                    f"https://api.github.com/repos/{repo_full_name}/contents/{file_path}",
+                    headers=github_headers,
+                    json={
+                        "message": msg,
+                        "content": encoded,
+                    },
                 )
-                return {"success": False, "error": "Netlify token needed — founder action created"}
+                if resp.status_code in (200, 201):
+                    files_pushed += 1
+                    logger.debug("Pushed %s to %s", file_path, repo_full_name)
+                else:
+                    err = f"{file_path}: {resp.status_code} {resp.text[:100]}"
+                    push_errors.append(err)
+                    logger.warning("Failed to push %s: %s", file_path, err)
 
-            # Step 1: Create Netlify site
+            # Push JSON-encoded code artifacts (api_code, core_code, etc.)
+            json_artifacts = ["api_code", "core_code", "auth_payments_code", "landing_page"]
+            for artifact_key in json_artifacts:
+                raw = code_artifacts.get(artifact_key)
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(parsed, dict):
+                        for file_path, file_content in parsed.items():
+                            # Clean file path — remove leading slash if present
+                            clean_path = file_path.lstrip("/")
+                            await _push_file(
+                                clean_path,
+                                file_content,
+                                f"feat: {clean_path} [{artifact_key}]",
+                            )
+                    else:
+                        logger.warning("Artifact %s parsed to non-dict type: %s", artifact_key, type(parsed))
+                except json.JSONDecodeError as je:
+                    # Not valid JSON — push as a single file
+                    fallback_name = {
+                        "api_code": "src/api/index.ts",
+                        "core_code": "src/core/index.tsx",
+                        "auth_payments_code": "src/auth/index.ts",
+                        "landing_page": "src/app/page.tsx",
+                    }.get(artifact_key, f"src/{artifact_key}.ts")
+                    logger.warning("Artifact %s is not valid JSON — pushing as %s: %s", artifact_key, fallback_name, str(je)[:80])
+                    await _push_file(fallback_name, raw, f"feat: {fallback_name} [{artifact_key}]")
+
+            # Push schema_sql as a migration file (raw SQL, not JSON)
+            schema_sql = code_artifacts.get("schema_sql")
+            if schema_sql:
+                await _push_file(
+                    "supabase/migrations/001_schema.sql",
+                    schema_sql,
+                    "feat: database schema migration",
+                )
+
+            logger.info("Pushed %d files to %s (%d errors)", files_pushed, repo_full_name, len(push_errors))
+
+            if files_pushed == 0:
+                return {"success": False, "error": f"No files pushed to GitHub. Errors: {'; '.join(push_errors[:3])}"}
+
+            # ── Step 5: Create Netlify site linked to repo ────────────
+            logger.info("Creating Netlify site %s linked to %s", site_name, repo_full_name)
             create_resp = await http.post(
                 "https://api.netlify.com/api/v1/sites",
                 headers={"Authorization": f"Bearer {netlify_token}"},
@@ -1740,7 +1915,7 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
                     "custom_domain": f"{subdomain}.zeroorigine.com",
                     "repo": {
                         "provider": "github",
-                        "repo": "ispeedbiz/zo-saas-template",
+                        "repo": repo_full_name,
                         "branch": "main",
                         "cmd": "npm run build",
                         "dir": ".next",
@@ -1748,31 +1923,31 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
                 },
             )
 
+            site_id = ""
             if create_resp.status_code in (200, 201):
                 site_data = create_resp.json()
                 site_id = site_data.get("id", "")
                 netlify_url = site_data.get("ssl_url") or site_data.get("url") or live_url
                 logger.info("Netlify site created: %s (ID: %s)", netlify_url, site_id)
             else:
-                # Site might already exist — try to find it
                 logger.warning("Netlify create returned %s: %s", create_resp.status_code, create_resp.text[:200])
                 netlify_url = live_url
-                site_id = ""
 
-            # Step 2: Update database
+            # ── Step 6: Update database ───────────────────────────────
             update_data = {
                 "status": "launched",
                 "netlify_url": netlify_url,
                 "netlify_site_id": site_id,
+                "github_repo": repo_full_name,
                 "subdomain": subdomain,
                 "launched_at": datetime.now(timezone.utc).isoformat(),
                 "lifecycle_state": "new",
                 "health_score": 100,
             }
             client.table("zo_projects").update(update_data).eq("project_id", project_id).execute()
-            logger.info("Project %s updated: status=launched, url=%s", project_id, netlify_url)
+            logger.info("Project %s updated: status=launched, url=%s, repo=%s", project_id, netlify_url, repo_full_name)
 
-            # Step 3: Register with Health Pulse (first check)
+            # ── Step 7: Register with Health Pulse ────────────────────
             try:
                 from .graphs.immune_system import run_health_check
                 asyncio.create_task(run_health_check(project_id))
@@ -1784,7 +1959,10 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
                 "success": True,
                 "url": netlify_url,
                 "site_id": site_id,
+                "github_repo": repo_full_name,
                 "subdomain": subdomain,
+                "files_pushed": files_pushed,
+                "push_errors": push_errors[:5] if push_errors else [],
             }
 
     except Exception as e:
