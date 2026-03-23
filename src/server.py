@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.8.1",
+    version="3.9.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -78,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.8.1",
+        "version": "3.9.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1162,7 +1162,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.8.1)\n"
+        f"Railway: OK (v3.9.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1551,14 +1551,17 @@ async def _run_builder_safe(project_id: str, product_name: str):
             # Load QA context from the pipeline manifest
             qa_context = manifest.get("qa_context")
 
-            # B-020: Extract build artifacts for QA code review
-            code_for_qa = {
-                "schema_sql": (state.get("schema_sql", "") or "")[:3000],
-                "api_code": (state.get("api_code", "") or "")[:3000],
-                "core_code": (state.get("core_code", "") or "")[:3000],
-                "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
-                "landing_page": (state.get("landing_page", "") or "")[:3000],
-            }
+            # B-020: Load build artifacts from zo_projects.metadata (NOT event payload)
+            # Code stored there by builder.py emit_result() to avoid pg_net 8KB limit
+            try:
+                proj = db.get_client().table("zo_projects").select("metadata").eq("project_id", project_id).execute()
+                meta = proj.data[0].get("metadata", "{}") if proj.data else "{}"
+                if isinstance(meta, str):
+                    meta = json.loads(meta)
+                code_for_qa = meta.get("code_for_qa", {})
+            except Exception as e:
+                logger.warning("Could not load code_for_qa from metadata: %s", e)
+                code_for_qa = {}
 
             # Trigger QA automatically with pipeline context + build artifacts
             try:

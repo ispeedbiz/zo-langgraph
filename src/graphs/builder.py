@@ -78,11 +78,11 @@ async def _save_step_checkpoint(
         node_name=node_name,
         step_number=step_number,
         state_data={
-            "schema_sql": state.get("schema_sql", ""),
-            "api_code": state.get("api_code", ""),
-            "core_code": state.get("core_code", ""),
-            "auth_payments_code": state.get("auth_payments_code", ""),
-            "landing_page": state.get("landing_page", ""),
+            "schema_sql": (state.get("schema_sql", "") or "")[:4000],
+            "api_code": (state.get("api_code", "") or "")[:4000],
+            "core_code": (state.get("core_code", "") or "")[:4000],
+            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:4000],
+            "landing_page": (state.get("landing_page", "") or "")[:4000],
             "current_step": step_number,
             "total_tokens": state.get("total_tokens", 0),
             "total_cost_usd": state.get("total_cost_usd", 0),
@@ -873,7 +873,24 @@ async def emit_result(state: BuildState) -> BuildState:
     """Emit the build_complete event so downstream agents can pick it up."""
     state["status"] = "complete"
 
-    # Build a summary payload (don't stuff entire code into the event)
+    # Store code artifacts in zo_projects.metadata (NOT in event payload)
+    # pg_net has 8KB limit on webhook payloads — code would exceed it
+    try:
+        code_for_qa = {
+            "schema_sql": (state.get("schema_sql", "") or "")[:3000],
+            "api_code": (state.get("api_code", "") or "")[:3000],
+            "core_code": (state.get("core_code", "") or "")[:3000],
+            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
+            "landing_page": (state.get("landing_page", "") or "")[:3000],
+        }
+        db.get_client().table("zo_projects").update({
+            "metadata": json.dumps({"code_for_qa": code_for_qa, "build_stage": "complete"}),
+        }).eq("project_id", state["project_id"]).execute()
+        logger.info("Code artifacts saved to zo_projects.metadata for QA")
+    except Exception as e:
+        logger.error("Failed to save code artifacts to metadata: %s", e)
+
+    # Event payload stays SMALL (under 8KB for pg_net)
     payload: dict[str, Any] = {
         "project_id": state["project_id"],
         "product_name": state.get("product_name", ""),
@@ -889,15 +906,7 @@ async def emit_result(state: BuildState) -> BuildState:
             "auth_payments_code_chars": len(state.get("auth_payments_code", "")),
             "landing_page_chars": len(state.get("landing_page", "")),
         },
-        # B-020 Fix 2: Include actual code snippets for QA code review
-        # Truncated to 3000 chars each to fit in event payload
-        "code_for_qa": {
-            "schema_sql": (state.get("schema_sql", "") or "")[:3000],
-            "api_code": (state.get("api_code", "") or "")[:3000],
-            "core_code": (state.get("core_code", "") or "")[:3000],
-            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
-            "landing_page": (state.get("landing_page", "") or "")[:3000],
-        },
+        "code_available_in": "zo_projects.metadata.code_for_qa",
     }
 
     await db.emit_event(
