@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.6.0",
+    version="3.7.0",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -30,6 +30,21 @@ app = FastAPI(
 # ── Diagnostic State ───────────────────────────────────
 _last_pipeline_error: dict = {}
 _last_pipeline_result: dict = {}
+
+
+@app.on_event("startup")
+async def recover_stuck_builds():
+    """On Railway restart, reset any projects stuck in 'building' state."""
+    try:
+        client = db.get_client()
+        stuck = client.table("zo_projects").select("project_id,name").eq("status", "building").execute()
+        if stuck.data:
+            for p in stuck.data:
+                client.table("zo_projects").update({"status": "approved"}).eq("project_id", p["project_id"]).execute()
+                logger.warning("Recovered stuck build: %s (%s) → reset to approved", p["name"], p["project_id"])
+            logger.info("Recovered %d stuck builds on startup", len(stuck.data))
+    except Exception as e:
+        logger.error("Failed to recover stuck builds: %s", e)
 
 # ── Request Models ──────────────────────────────────────
 
@@ -63,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.6.0",
+        "version": "3.7.0",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -803,6 +818,8 @@ async def handle_telegram_command_v2(req: dict):
             return {"text": await _cmd_learnings()}
         elif command == "supporters":
             return {"text": await _cmd_supporters()}
+        elif command == "rebuild" and args:
+            return {"text": await _cmd_rebuild(args)}
         else:
             return {"text": f"Unknown command: /{command}\nType /help for available commands."}
     except Exception as e:
@@ -1127,7 +1144,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.6.0)\n"
+        f"Railway: OK (v3.7.0)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1384,6 +1401,21 @@ async def _cmd_resume() -> str:
     return "▶️ ECOSYSTEM RESUMED\n\nPipeline activity restored."
 
 
+async def _cmd_rebuild(name: str) -> str:
+    """Reset a stuck build and re-trigger it."""
+    client = db.get_client()
+    projects = client.table("zo_projects").select("project_id,name,status").ilike("name", name).execute().data
+    if not projects:
+        return f'No project named "{name}". Type /projects.'
+    p = projects[0]
+    # Reset to approved regardless of current status
+    client.table("zo_projects").update({"status": "approved"}).eq("project_id", p["project_id"]).execute()
+    # Trigger fresh build
+    asyncio.create_task(_run_builder_safe(p["project_id"], p["name"]))
+    client.table("zo_projects").update({"status": "building"}).eq("project_id", p["project_id"]).execute()
+    return f"🔄 {p['name']} reset and rebuild triggered.\nPrevious status was: {p['status']}\n\nFull chain: Architect → Build → QA → Marketing → Deploy"
+
+
 async def _cmd_build(name: str) -> str:
     client = db.get_client()
     projects = client.table("zo_projects").select("project_id,name,status,research_score,category").ilike("name", name).execute().data
@@ -1392,9 +1424,9 @@ async def _cmd_build(name: str) -> str:
 
     p = projects[0]
     if p["status"] == "building":
-        return f'🔨 {p["name"]} is already being built.'
+        return f'🔨 {p["name"]} is already being built. Use /rebuild {p["name"]} to reset and retry.'
     if p["status"] not in ("approved", "pending_approval"):
-        return f'{p["name"]} status is "{p["status"]}". Only approved projects can be built.'
+        return f'{p["name"]} status is "{p["status"]}". Use /rebuild {p["name"]} to force rebuild.'
 
     # Update status to building
     client.table("zo_projects").update({"status": "building"}).eq("project_id", p["project_id"]).execute()
@@ -1407,10 +1439,11 @@ async def _cmd_build(name: str) -> str:
 
 
 async def _run_builder_safe(project_id: str, product_name: str):
-    """Run Builder Mind in background with error handling and Telegram notification."""
+    """Run Builder Mind in background with timeout, heartbeat, and error recovery."""
     import httpx
     BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
     CHAT_ID = "8685703404"
+    BUILD_TIMEOUT = 600  # 10 minutes max per step
 
     async def notify(text: str):
         try:
@@ -1423,14 +1456,27 @@ async def _run_builder_safe(project_id: str, product_name: str):
         except Exception as e:
             logger.error("Failed to send Telegram notification: %s", e)
 
+    async def heartbeat(stage: str):
+        """Update project status with current stage so we know where it is."""
+        try:
+            db.get_client().table("zo_projects").update({
+                "metadata": json.dumps({"build_stage": stage, "heartbeat": datetime.now(timezone.utc).isoformat()}),
+            }).eq("project_id", project_id).execute()
+        except Exception:
+            pass
+
     try:
         logger.info("Builder Mind starting for %s (%s)", product_name, project_id)
+        await heartbeat("architect")
 
         # Run Build Architect first -- pre-build intelligence layer
         project_data = db.get_client().table("zo_projects").select("*").eq("project_id", project_id).execute()
         project_data = project_data.data[0] if project_data.data else {}
 
-        architect_result = await run_build_architect(project_id, project_data)
+        architect_result = await asyncio.wait_for(
+            run_build_architect(project_id, project_data),
+            timeout=BUILD_TIMEOUT,
+        )
 
         if not architect_result.get("build_ready"):
             await notify(f"⚠️ Pipeline Architect: {product_name} not ready\n\n{architect_result.get('reason', 'Unknown')}")
@@ -1456,7 +1502,11 @@ async def _run_builder_safe(project_id: str, product_name: str):
         # Pass build context to builder (backward compatible)
         build_context = manifest
 
-        state = await run_builder(project_id=project_id, build_context=build_context)
+        await heartbeat("building")
+        state = await asyncio.wait_for(
+            run_builder(project_id=project_id, build_context=build_context),
+            timeout=BUILD_TIMEOUT,
+        )
 
         if state.get("error"):
             # Build failed
@@ -1485,7 +1535,11 @@ async def _run_builder_safe(project_id: str, product_name: str):
 
             # Trigger QA automatically with pipeline context
             try:
-                qa_state = await run_qa(project_id=project_id, qa_context=qa_context)
+                await heartbeat("qa")
+                qa_state = await asyncio.wait_for(
+                    run_qa(project_id=project_id, qa_context=qa_context),
+                    timeout=BUILD_TIMEOUT,
+                )
                 if qa_state.get("passed"):
                     db.get_client().table("zo_projects").update({"status": "qa_passed"}).eq("project_id", project_id).execute()
                     await notify(f"✅ QA PASSED for {product_name}!\nScore: {qa_state.get('overall_score', '?')}/{qa_state.get('max_score', 140)}\n\n📢 Marketing Mind starting...")
@@ -1523,10 +1577,14 @@ async def _run_builder_safe(project_id: str, product_name: str):
                 logger.error("QA failed for %s: %s", product_name, qa_err)
                 await notify(f"⚠️ QA error for {product_name}: {str(qa_err)[:150]}")
 
+    except asyncio.TimeoutError:
+        logger.error("Builder Mind TIMED OUT for %s after %ds", product_name, BUILD_TIMEOUT)
+        db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
+        await notify(f"⏰ Build TIMED OUT for {product_name} (>{BUILD_TIMEOUT}s)\n\nUse /rebuild {product_name} to retry.")
     except Exception as e:
         logger.error("Builder Mind crashed for %s: %s", product_name, e, exc_info=True)
         db.get_client().table("zo_projects").update({"status": "build_failed"}).eq("project_id", project_id).execute()
-        await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}")
+        await notify(f"❌ Builder CRASHED for {product_name}\n\nError: {str(e)[:200]}\n\nUse /rebuild {product_name} to retry.")
 
 
 async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
