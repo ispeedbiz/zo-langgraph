@@ -21,8 +21,61 @@ logger = logging.getLogger("zo.graphs.qa")
 # ── Constants ────────────────────────────────────────────────
 
 DEFAULT_PASS_THRESHOLD = 100
+CODE_REVIEW_THRESHOLD = 70  # Lower threshold for code review (no live URL)
 MAX_SCORE = 140
 DEFAULT_MAX_ROUNDS = 3
+
+QA_CODE_REVIEW_PROMPT = """# QA Mind — Code Review Mode
+
+## Identity
+You are reviewing GENERATED CODE ARTIFACTS, NOT testing a live URL.
+Your job: evaluate architecture quality, security patterns, code completeness,
+and production readiness of code that has been generated but not yet deployed.
+
+## What You Have
+The Builder Mind generated code for a SaaS product. You have the actual code
+artifacts: database schema, API endpoints, core features, auth+payments, and
+landing page. Review these for quality.
+
+## Scoring Philosophy
+Be PRACTICAL, not perfectionist. This is generated code that will be deployed
+and iterated on. Score based on:
+- Will this work when deployed? (not "is it perfect?")
+- Are there security holes? (auth bypass, SQL injection, exposed keys)
+- Is the architecture sound? (separation of concerns, proper data modeling)
+- Will users have a functional experience? (core flow works end-to-end)
+
+A well-generated SaaS should score 80-120/140 in code review.
+Score 0 ONLY if the code fundamentally cannot work.
+
+## 7 CATEGORIES (same as live, but evaluated on code)
+
+1. Functionality (25 pts): Does the code cover all required features? Are API
+   routes complete? Does the schema support the data model? Are forms wired up?
+
+2. Security (25 pts): Auth implemented (Supabase Auth)? RLS policies defined?
+   Input validation present? API keys not hardcoded? CORS configured?
+
+3. Performance (20 pts): Efficient queries? Proper indexes? No N+1 patterns?
+   Images optimized? Bundle size reasonable?
+
+4. Accessibility (20 pts): Semantic HTML used? ARIA labels on interactive
+   elements? Keyboard navigation support? Color contrast sufficient?
+
+5. Mobile (20 pts): Responsive breakpoints defined? Touch targets adequate?
+   Viewport meta tag present? Mobile-first CSS?
+
+6. SEO (15 pts): Meta tags present? OG tags for sharing? Proper heading
+   hierarchy? Sitemap potential?
+
+7. Code Quality (15 pts): Clean file structure? Error handling present?
+   TypeScript types defined? Comments on complex logic?
+
+## OUTPUT FORMAT
+Return JSON with the standard test_results structure.
+IMPORTANT: Score honestly but generously. Generated code that covers the basics
+should score 70-90% in each category. Only mark critical failures as 0.
+"""
 
 QA_SYSTEM_PROMPT = """# QA Mind — The Engineer Mind
 
@@ -258,6 +311,10 @@ async def _run_tests(state: QAState) -> QAState:
     fixes_applied = state.get("fixes_applied", [])
     is_code_review = not deploy_url or deploy_url.strip() == ""
 
+    # Fix B-020: Lower threshold for code review — can't test live functionality
+    if is_code_review:
+        state["pass_threshold"] = CODE_REVIEW_THRESHOLD
+
     fixes_context = ""
     if fixes_applied:
         fixes_context = (
@@ -267,17 +324,27 @@ async def _run_tests(state: QAState) -> QAState:
 
     if is_code_review:
         # PHASE 1: Code Review Mode — no URL available yet
-        # Load build artifacts from the builder's checkpoint
+        # B-020 Fix 2: Load ACTUAL build artifacts, not just metadata
         build_artifacts = ""
         try:
-            checkpoint = state["project"].get("metadata", {})
-            if isinstance(checkpoint, str):
+            metadata = state["project"].get("metadata", {})
+            if isinstance(metadata, str):
                 import json as _json
-                checkpoint = _json.loads(checkpoint)
-            build_stage = checkpoint.get("build_stage", "")
-            build_artifacts = f"Build stage: {build_stage}"
+                metadata = _json.loads(metadata)
+            code_for_qa = metadata.get("code_for_qa", {})
+            if code_for_qa:
+                parts = []
+                for key, code in code_for_qa.items():
+                    if code and code.strip():
+                        parts.append(f"\n### {key.replace('_', ' ').title()}\n```\n{code[:2000]}\n```")
+                if parts:
+                    build_artifacts = "\n## ACTUAL BUILD ARTIFACTS (review this code):\n" + "\n".join(parts)
+                else:
+                    build_artifacts = "\n## No code artifacts available — score based on architecture design."
+            else:
+                build_artifacts = "\n## No code artifacts available — score based on architecture design."
         except Exception:
-            pass
+            build_artifacts = "\n## Could not load build artifacts."
 
         user_message = (
             f"## CODE REVIEW MODE (No deploy URL available yet)\n\n"
@@ -288,18 +355,9 @@ async def _run_tests(state: QAState) -> QAState:
             f"**QA Round:** {round_number} (Code Review)\n"
             f"{build_artifacts}\n"
             f"{fixes_context}\n\n"
-            f"This product has been built but NOT yet deployed. Review the DESIGN and ARCHITECTURE:\n\n"
-            f"Score these 7 categories based on CODE QUALITY (not live testing):\n"
-            f"1. Functionality (25): Does the architecture cover all required features?\n"
-            f"2. Security (25): Auth patterns, input validation, API key handling, RLS\n"
-            f"3. Performance (20): Efficient queries, proper indexing, no N+1, caching strategy\n"
-            f"4. Accessibility (20): Semantic HTML planned, ARIA labels, keyboard navigation\n"
-            f"5. Mobile (20): Responsive design, touch targets, viewport meta\n"
-            f"6. SEO (15): Meta tags, OG tags, structured data, sitemap\n"
-            f"7. Code Quality (15): Clean architecture, error handling, type safety\n\n"
-            f"Be generous but honest — this is a code review, not a live test.\n"
-            f"A well-architected product should score 80-120/140 in code review.\n"
-            f"Score 0 ONLY if the product fundamentally cannot work."
+            f"Review the actual code above. Score based on what you SEE in the code.\n"
+            f"A well-generated SaaS should score 80-120/140 in code review.\n"
+            f"Score 0 ONLY if the code fundamentally cannot work."
         )
         logger.info("QA running in CODE REVIEW mode for %s (no deploy URL)", project.get("name", "?"))
     else:
@@ -341,9 +399,12 @@ async def _run_tests(state: QAState) -> QAState:
         )
         extra_context = (extra_context or "") + learnings_text
 
+    # Fix B-020: Use CODE REVIEW prompt when no URL, not the live-testing prompt
+    system_prompt = QA_CODE_REVIEW_PROMPT if is_code_review else QA_SYSTEM_PROMPT
+
     response = await claude.call(
         agent_name="qa",
-        system_prompt=QA_SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         user_message=user_message,
         project_id=state["project_id"],
         workflow="qa_pipeline",
@@ -634,7 +695,7 @@ def _build_graph() -> StateGraph:
 
 # ── Public Entry Point ──────────────────────────────────────
 
-async def run_qa(project_id: str, qa_context: dict | None = None) -> QAState:
+async def run_qa(project_id: str, qa_context: dict | None = None, build_artifacts: dict | None = None) -> QAState:
     """Run the full QA pipeline for a project.
 
     Loads project data, executes the 7-category test suite, performs root cause
@@ -691,6 +752,13 @@ async def run_qa(project_id: str, qa_context: dict | None = None) -> QAState:
             logger.info(
                 "Resuming QA from round %d (previous checkpoint found)", round_number,
             )
+
+    # B-020 Fix 2: Store build artifacts so QA code review has actual code
+    if build_artifacts:
+        # Inject into project metadata so _run_tests can access it
+        if not isinstance(project.get("metadata"), dict):
+            project["metadata"] = {}
+        project["metadata"]["code_for_qa"] = build_artifacts
 
     # Build initial state
     initial_state: QAState = {

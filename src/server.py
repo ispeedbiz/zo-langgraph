@@ -583,7 +583,25 @@ async def _handle_build_complete(project_id: str | None, payload: dict) -> dict:
     except Exception as e:
         logger.warning("Failed to load pipeline manifest for QA context: %s", e)
 
-    state = await run_qa(project_id=project_id, qa_context=qa_context)
+    # B-020 Fix 2: Pass actual build artifacts to QA for code review
+    code_for_qa = payload.get("code_for_qa", {})
+    if not code_for_qa:
+        # Try loading from builder checkpoint
+        try:
+            checkpoint = await db.get_latest_checkpoint(project_id, "builder")
+            if checkpoint:
+                sd = checkpoint.get("state_data", {})
+                code_for_qa = {
+                    "schema_sql": (sd.get("schema_sql", "") or "")[:3000],
+                    "api_code": (sd.get("api_code", "") or "")[:3000],
+                    "core_code": (sd.get("core_code", "") or "")[:3000],
+                    "auth_payments_code": (sd.get("auth_payments_code", "") or "")[:3000],
+                    "landing_page": (sd.get("landing_page", "") or "")[:3000],
+                }
+        except Exception as e:
+            logger.warning("Could not load builder checkpoint for QA: %s", e)
+
+    state = await run_qa(project_id=project_id, qa_context=qa_context, build_artifacts=code_for_qa)
     return {
         "status": state.get("status", "unknown"),
         "score": f"{state.get('overall_score', 0)}/{state.get('max_score', 140)}",

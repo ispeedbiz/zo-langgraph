@@ -889,6 +889,15 @@ async def emit_result(state: BuildState) -> BuildState:
             "auth_payments_code_chars": len(state.get("auth_payments_code", "")),
             "landing_page_chars": len(state.get("landing_page", "")),
         },
+        # B-020 Fix 2: Include actual code snippets for QA code review
+        # Truncated to 3000 chars each to fit in event payload
+        "code_for_qa": {
+            "schema_sql": (state.get("schema_sql", "") or "")[:3000],
+            "api_code": (state.get("api_code", "") or "")[:3000],
+            "core_code": (state.get("core_code", "") or "")[:3000],
+            "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
+            "landing_page": (state.get("landing_page", "") or "")[:3000],
+        },
     }
 
     await db.emit_event(
