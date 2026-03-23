@@ -324,27 +324,38 @@ async def _run_tests(state: QAState) -> QAState:
 
     if is_code_review:
         # PHASE 1: Code Review Mode — no URL available yet
-        # B-020 Fix 2: Load ACTUAL build artifacts, not just metadata
+        # B-020-v4: Load build artifacts from project metadata
         build_artifacts = ""
         try:
             metadata = state["project"].get("metadata", {})
+            logger.info("QA code review: metadata type=%s, len=%s", type(metadata).__name__,
+                       len(str(metadata)) if metadata else 0)
             if isinstance(metadata, str):
                 import json as _json
                 metadata = _json.loads(metadata)
+            if not isinstance(metadata, dict):
+                metadata = {}
             code_for_qa = metadata.get("code_for_qa", {})
+            logger.info("QA code review: code_for_qa has %d keys: %s",
+                       len(code_for_qa), list(code_for_qa.keys()) if code_for_qa else "empty")
             if code_for_qa:
                 parts = []
                 for key, code in code_for_qa.items():
-                    if code and code.strip():
+                    if code and isinstance(code, str) and code.strip():
                         parts.append(f"\n### {key.replace('_', ' ').title()}\n```\n{code[:2000]}\n```")
                 if parts:
                     build_artifacts = "\n## ACTUAL BUILD ARTIFACTS (review this code):\n" + "\n".join(parts)
+                    logger.info("QA code review: %d code sections loaded (%d total chars)",
+                               len(parts), len(build_artifacts))
                 else:
                     build_artifacts = "\n## No code artifacts available — score based on architecture design."
+                    logger.warning("QA code review: code_for_qa keys exist but all empty")
             else:
                 build_artifacts = "\n## No code artifacts available — score based on architecture design."
-        except Exception:
+                logger.warning("QA code review: no code_for_qa in metadata")
+        except Exception as e:
             build_artifacts = "\n## Could not load build artifacts."
+            logger.error("QA code review: failed to load artifacts: %s", e)
 
         user_message = (
             f"## CODE REVIEW MODE (No deploy URL available yet)\n\n"

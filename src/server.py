@@ -22,7 +22,7 @@ logger = logging.getLogger("zo.server")
 
 app = FastAPI(
     title="ZeroOrigine LangGraph Service",
-    version="3.9.1",
+    version="3.9.2",
     description="AI Brain for the ZeroOrigine Autonomous SaaS Ecosystem",
 )
 
@@ -78,7 +78,7 @@ async def health():
     return {
         "status": "ok",
         "service": "zo-langgraph",
-        "version": "3.9.1",
+        "version": "3.9.2",
         "graphs": ["research_a", "research_b", "ethics", "builder", "qa", "marketing", "immune_system"],
         "ecosystem_status": ecosystem_status,
     }
@@ -1162,7 +1162,7 @@ async def _cmd_health() -> str:
 
     return (
         f"ZeroOrigine Health\n\n"
-        f"Railway: OK (v3.9.1)\n"
+        f"Railway: OK (v3.9.2)\n"
         f"Graphs: research_a, research_b, ethics, builder, qa, marketing\n"
         f"Ecosystem: active\n\n"
         f"Projects: {len(projects)} total\n"
@@ -1485,8 +1485,9 @@ async def _run_builder_safe(project_id: str, product_name: str):
                 meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
             meta["build_stage"] = stage
             meta["heartbeat"] = datetime.now(timezone.utc).isoformat()
+            # Pass dict directly — no json.dumps() (Supabase handles serialization)
             db.get_client().table("zo_projects").update({
-                "metadata": json.dumps(meta),
+                "metadata": meta,
             }).eq("project_id", project_id).execute()
         except Exception:
             pass
@@ -1559,14 +1560,18 @@ async def _run_builder_safe(project_id: str, product_name: str):
             # Load QA context from the pipeline manifest
             qa_context = manifest.get("qa_context")
 
-            # B-020: Load build artifacts from zo_projects.metadata (NOT event payload)
-            # Code stored there by builder.py emit_result() to avoid pg_net 8KB limit
+            # B-020-v4: Load build artifacts DIRECTLY from zo_projects.metadata
             try:
                 proj = db.get_client().table("zo_projects").select("metadata").eq("project_id", project_id).execute()
-                meta = proj.data[0].get("metadata", "{}") if proj.data else "{}"
+                meta = proj.data[0].get("metadata") if proj.data else {}
+                # Handle both string (old double-serialized) and dict (correct)
                 if isinstance(meta, str):
                     meta = json.loads(meta)
+                if not isinstance(meta, dict):
+                    meta = {}
                 code_for_qa = meta.get("code_for_qa", {})
+                logger.info("QA code_for_qa loaded: %d keys, %d total chars",
+                           len(code_for_qa), sum(len(v) for v in code_for_qa.values()) if code_for_qa else 0)
             except Exception as e:
                 logger.warning("Could not load code_for_qa from metadata: %s", e)
                 code_for_qa = {}

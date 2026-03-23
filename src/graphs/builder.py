@@ -883,10 +883,13 @@ async def emit_result(state: BuildState) -> BuildState:
             "auth_payments_code": (state.get("auth_payments_code", "") or "")[:3000],
             "landing_page": (state.get("landing_page", "") or "")[:3000],
         }
+        # Pass dict directly — Supabase client handles JSON serialization
+        # DO NOT use json.dumps() — causes double-serialization
         db.get_client().table("zo_projects").update({
-            "metadata": json.dumps({"code_for_qa": code_for_qa, "build_stage": "complete"}),
+            "metadata": {"code_for_qa": code_for_qa, "build_stage": "complete"},
         }).eq("project_id", state["project_id"]).execute()
-        logger.info("Code artifacts saved to zo_projects.metadata for QA")
+        logger.info("Code artifacts saved to zo_projects.metadata for QA (%d total chars)",
+                     sum(len(v) for v in code_for_qa.values()))
     except Exception as e:
         logger.error("Failed to save code artifacts to metadata: %s", e)
 
