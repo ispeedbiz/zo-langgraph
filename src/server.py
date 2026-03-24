@@ -1918,16 +1918,23 @@ async def _auto_deploy_product(project_id: str, product_name: str) -> dict:
 
     logger.info("Auto-deploying %s → GitHub repo %s → Netlify %s", product_name, repo_name, site_name)
 
-    # ── Resolve tokens ────────────────────────────────────────────
+    # ── Resolve tokens (zo_config FIRST — founder's tokens take priority) ──
     def _get_token(env_key: str) -> str:
+        token = ""
+        # 1. Check zo_config first (founder-provided, most trusted)
+        try:
+            cfg = client.table("zo_config").select("value").eq("key", env_key).execute()
+            if cfg.data and cfg.data[0].get("value"):
+                token = cfg.data[0]["value"].strip().strip('"')
+                if token:
+                    logger.info("Token %s resolved from zo_config", env_key)
+                    return token
+        except Exception:
+            pass
+        # 2. Fallback to env vars (Railway)
         token = os.environ.get(env_key, "")
-        if not token:
-            try:
-                cfg = client.table("zo_config").select("value").eq("key", env_key).execute()
-                if cfg.data:
-                    token = cfg.data[0]["value"]
-            except Exception:
-                pass
+        if token:
+            logger.info("Token %s resolved from env var", env_key)
         return token
 
     github_token = _get_token("GITHUB_TOKEN")
