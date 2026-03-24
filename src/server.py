@@ -108,6 +108,40 @@ async def deploy_manual(project_id: str):
             if s.startswith(p): s = s[len(p):]
         if s.endswith("```"): s = s[:-3]
         return s.strip()
+
+    def extract_file_map(raw_content):
+        """Extract file map from Claude's raw response using regex.
+        Handles markdown fences, real newlines, escaped quotes."""
+        if not raw_content or not isinstance(raw_content, str):
+            return {}
+        content = sf(raw_content)
+        # Method 1: json.loads with strict=False
+        try:
+            result = json.loads(content, strict=False)
+            if isinstance(result, dict):
+                return result
+        except: pass
+        # Method 2: Regex extraction for file paths
+        import re as _re
+        file_map = {}
+        pattern = r'"([^"]*(?:\.tsx?|\.jsx?|\.css|\.sql|\.json|\.md|\.ts)[^"]*)"\s*:\s*"'
+        for match in _re.finditer(pattern, content):
+            filepath = match.group(1)
+            start = match.end()
+            i = start
+            while i < len(content):
+                ch = content[i]
+                if ch == '\\' and i + 1 < len(content):
+                    i += 2
+                    continue
+                if ch == '"':
+                    break
+                i += 1
+            if i < len(content):
+                value = content[start:i]
+                value = value.replace('\\n', '\n').replace('\\t', '\t').replace('\\"', '"').replace('\\\\', '\\')
+                file_map[filepath] = value
+        return file_map
     async with httpx.AsyncClient(timeout=60) as client:
         # Delete existing repo first for clean deploy
         await client.delete(f"https://api.github.com/repos/ZeroOrigine/{repo_name}",
@@ -137,38 +171,15 @@ async def deploy_manual(project_id: str):
                 file_list.append("supabase/migrations/001_schema.sql")
                 continue
 
-            # Parse the file map — try multiple approaches
+            # Parse the file map using robust extractor
             fmap = None
 
-            # If val is already a dict (Supabase JSONB auto-parsed)
             if isinstance(val, dict):
                 fmap = val
                 logger.info("Deploy %s: already a dict with %d keys", key, len(val))
             elif isinstance(val, str):
-                # Strip markdown fences
-                cleaned = sf(val)
-                # Try parsing
-                try:
-                    fmap = json.loads(cleaned)
-                    logger.info("Deploy %s: parsed JSON, %d keys", key, len(fmap) if isinstance(fmap, dict) else 0)
-                except json.JSONDecodeError as e:
-                    logger.warning("Deploy %s: JSON parse failed at pos %d: %s", key, e.pos, str(e)[:100])
-                    # Try with strict=False (allows control chars)
-                    try:
-                        import json as json_mod
-                        decoder = json_mod.JSONDecoder(strict=False)
-                        fmap, _ = decoder.raw_decode(cleaned)
-                        logger.info("Deploy %s: parsed with strict=False, %d keys", key, len(fmap) if isinstance(fmap, dict) else 0)
-                    except Exception as e2:
-                        logger.error("Deploy %s: strict=False also failed: %s", key, str(e2)[:100])
-                        # Last resort: push as single file
-                        r = await client.put(
-                            f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/src/gen/{key}.txt",
-                            headers={"Authorization": f"token {github_token}"},
-                            json={"message": key, "content": base64.b64encode(val.encode()).decode()})
-                        if r.status_code in (200, 201): pushed += 1
-                        errs.append(f"{key}: JSON parse failed, pushed as .txt")
-                        continue
+                fmap = extract_file_map(val)
+                logger.info("Deploy %s: extracted %d files", key, len(fmap))
 
             if not isinstance(fmap, dict):
                 logger.warning("Deploy %s: fmap is not dict (type=%s)", key, type(fmap).__name__)
