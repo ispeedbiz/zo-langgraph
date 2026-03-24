@@ -161,6 +161,47 @@ async def deploy_manual(project_id: str):
     return results
 
 
+
+@app.get("/debug/artifact/{project_id}/{key}")
+async def debug_artifact(project_id: str, key: str):
+    """Get a single deploy artifact, properly parsed."""
+    project = await db.get_project(project_id)
+    if not project:
+        return {"error": "not found"}
+    metadata = project.get("metadata", {})
+    if isinstance(metadata, str):
+        try: metadata = json.loads(metadata)
+        except: return {"error": "metadata parse fail"}
+    artifacts = metadata.get("deploy_artifacts", metadata.get("code_for_qa", {}))
+    raw = artifacts.get(key, "")
+    if not raw:
+        return {"error": f"key {key} not found", "available": list(artifacts.keys())}
+    
+    # Strip markdown fences
+    s = raw.strip()
+    if s.startswith("```json"): s = s[7:]
+    elif s.startswith("```"): s = s[3:]
+    if s.endswith("```"): s = s[:-3]
+    s = s.strip()
+    
+    if key == "schema_sql":
+        return {"key": key, "type": "sql", "chars": len(raw), "content": raw}
+    
+    try:
+        file_map = json.loads(s)
+        if isinstance(file_map, dict):
+            return {
+                "key": key,
+                "type": "file_map",
+                "file_count": len(file_map),
+                "files": {fp: len(fc) for fp, fc in file_map.items()},
+                "content": file_map,
+            }
+        return {"key": key, "type": "other", "content": s[:500]}
+    except json.JSONDecodeError as e:
+        return {"key": key, "type": "parse_error", "error": str(e), "raw_preview": s[:200]}
+
+
 @app.get("/debug/deploy-artifacts/{project_id}")
 async def debug_deploy_artifacts(project_id: str):
     """Show deploy artifacts — what code exists for this project."""
