@@ -113,6 +113,106 @@ async def debug_deploy_artifacts(project_id: str):
     return result
 
 
+
+@app.get("/debug/test-deploy")
+async def debug_test_deploy():
+    """Step 2: Test deploy path with dummy. Creates test repo + Netlify site. $0 cost."""
+    import httpx
+    results = {}
+    
+    # Get tokens
+    github_token = os.environ.get('GITHUB_TOKEN')
+    if not github_token:
+        try:
+            r = db.get_client().table('zo_config').select('value').eq('key', 'GITHUB_TOKEN').execute()
+            github_token = r.data[0]['value'] if r.data else None
+        except: pass
+    
+    netlify_token = os.environ.get('NETLIFY_API_TOKEN')
+    if not netlify_token:
+        try:
+            r = db.get_client().table('zo_config').select('value').eq('key', 'NETLIFY_API_TOKEN').execute()
+            netlify_token = r.data[0]['value'] if r.data else None
+        except: pass
+    
+    results['github_token'] = 'present' if github_token else 'MISSING'
+    results['netlify_token'] = 'present' if netlify_token else 'MISSING'
+    
+    if not github_token or not netlify_token:
+        return results
+    
+    async with httpx.AsyncClient(timeout=30) as client:
+        # Test 1: Can we create a GitHub repo?
+        try:
+            resp = await client.post(
+                'https://api.github.com/repos/ZeroOrigine/zo-saas-template/generate',
+                headers={
+                    'Authorization': f'token {github_token}',
+                    'Accept': 'application/vnd.github.baptiste-preview+json',
+                },
+                json={'owner': 'ZeroOrigine', 'name': 'zo-deploy-test', 'private': False},
+            )
+            if resp.status_code == 201:
+                results['github_create_repo'] = 'SUCCESS'
+                results['github_repo_url'] = resp.json().get('html_url', '')
+            elif resp.status_code == 422:
+                results['github_create_repo'] = 'ALREADY_EXISTS (OK)'
+                results['github_repo_url'] = 'https://github.com/ZeroOrigine/zo-deploy-test'
+            else:
+                results['github_create_repo'] = f'FAILED ({resp.status_code}): {resp.text[:200]}'
+        except Exception as e:
+            results['github_create_repo'] = f'ERROR: {str(e)[:200]}'
+        
+        # Test 2: Can we push a file?
+        import base64
+        try:
+            test_html = '<html><body><h1>ZeroOrigine Deploy Test</h1><p>If you see this, deploy works.</p></body></html>'
+            resp = await client.put(
+                'https://api.github.com/repos/ZeroOrigine/zo-deploy-test/contents/index.html',
+                headers={'Authorization': f'token {github_token}'},
+                json={
+                    'message': 'test: deploy verification',
+                    'content': base64.b64encode(test_html.encode()).decode(),
+                },
+            )
+            if resp.status_code in (200, 201):
+                results['github_push_file'] = 'SUCCESS'
+            elif resp.status_code == 422:
+                results['github_push_file'] = 'FILE_EXISTS (OK — repo already has content)'
+            else:
+                results['github_push_file'] = f'FAILED ({resp.status_code}): {resp.text[:200]}'
+        except Exception as e:
+            results['github_push_file'] = f'ERROR: {str(e)[:200]}'
+        
+        # Test 3: Can we create a Netlify site?
+        try:
+            resp = await client.post(
+                'https://api.netlify.com/api/v1/sites',
+                headers={'Authorization': f'Bearer {netlify_token}'},
+                json={
+                    'repo': {
+                        'provider': 'github',
+                        'repo': 'ZeroOrigine/zo-deploy-test',
+                        'branch': 'main',
+                        'cmd': '',
+                        'dir': '',
+                    },
+                    'name': 'zo-deploy-test',
+                },
+            )
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                results['netlify_create_site'] = 'SUCCESS'
+                results['netlify_url'] = data.get('ssl_url', data.get('url', ''))
+                results['netlify_site_id'] = data.get('id', '')
+            else:
+                results['netlify_create_site'] = f'FAILED ({resp.status_code}): {resp.text[:200]}'
+        except Exception as e:
+            results['netlify_create_site'] = f'ERROR: {str(e)[:200]}'
+    
+    return results
+
+
 @app.get("/debug/qa-dry-run/{project_id}")
 async def debug_qa_dry_run(project_id: str):
     """Show exactly what QA would receive — $0 cost, no Claude call."""
