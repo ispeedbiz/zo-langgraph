@@ -1616,10 +1616,31 @@ Only include patches for components that need fixing. Leave others as empty stri
 
 
 async def _run_builder_safe(project_id: str, product_name: str):
-    """Run Builder Mind in background with timeout, heartbeat, and error recovery."""
+    """Run Builder Mind in background with timeout, heartbeat, and error recovery.
+
+    RULE: SEQUENTIAL, NOT PARALLEL. One product builds at a time.
+    If any product is already building, this build is REFUSED.
+    """
     import httpx
     BOT_TOKEN = config.telegram_bot_token
     CHAT_ID = config.telegram_chat_id
+
+    # SEQUENTIAL BUILD ENFORCEMENT — one product at a time, no exceptions
+    try:
+        building = db.get_client().table("zo_projects").select("project_id,name").eq("status", "building").execute()
+        if building.data:
+            already = building.data[0]
+            logger.warning("BUILD REFUSED for %s — %s is already building. Sequential rule enforced.",
+                          product_name, already["name"])
+            async with httpx.AsyncClient() as client:
+                await client.post(
+                    f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+                    json={"chat_id": CHAT_ID, "text": f"⛔ Build REFUSED for {product_name}\n\n{already['name']} is already building.\nRule: ONE product at a time.\n\nWait for {already['name']} to finish, then retry."},
+                    timeout=10,
+                )
+            return
+    except Exception as e:
+        logger.error("Sequential check failed: %s — proceeding with caution", e)
     # Dynamic timeout based on product tier — Freedom principle: no artificial ceilings
     # Micro-SaaS: 6 steps × ~90s = ~9min, with buffer → 15 min
     # Standard SaaS: 6 steps × ~120s + QA rounds → 30 min
