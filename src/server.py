@@ -109,10 +109,14 @@ async def deploy_manual(project_id: str):
         if s.endswith("```"): s = s[:-3]
         return s.strip()
     async with httpx.AsyncClient(timeout=60) as client:
+        # Delete existing repo first for clean deploy
+        await client.delete(f"https://api.github.com/repos/ZeroOrigine/{repo_name}",
+            headers={"Authorization": f"token {github_token}"})
+        await asyncio.sleep(2)
         r = await client.post("https://api.github.com/repos/ZeroOrigine/zo-saas-template/generate",
             headers={"Authorization": f"token {github_token}", "Accept": "application/vnd.github.baptiste-preview+json"},
             json={"owner": "ZeroOrigine", "name": repo_name, "private": False})
-        results["steps"]["repo"] = "OK" if r.status_code == 201 else ("EXISTS" if r.status_code == 422 else f"FAIL:{r.status_code}")
+        results["steps"]["repo"] = "OK" if r.status_code == 201 else f"FAIL:{r.status_code}:{r.text[:100]}"
         await asyncio.sleep(5)
         pushed, errs = 0, []
         for key, val in artifacts.items():
