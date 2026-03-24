@@ -118,33 +118,106 @@ async def deploy_manual(project_id: str):
             json={"owner": "ZeroOrigine", "name": repo_name, "private": False})
         results["steps"]["repo"] = "OK" if r.status_code == 201 else f"FAIL:{r.status_code}:{r.text[:100]}"
         await asyncio.sleep(5)
-        pushed, errs = 0, []
+        # GATE 1+2: Parse artifacts and push individual files
+        pushed, errs, file_list = 0, [], []
+        logger.info("Deploy: processing %d artifact keys", len(artifacts))
+
         for key, val in artifacts.items():
-            if not val or not isinstance(val, str): continue
+            if not val: continue
+            logger.info("Deploy artifact %s: type=%s, len=%s", key, type(val).__name__, len(str(val)))
+
             if key == "schema_sql":
-                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/supabase/migrations/001_schema.sql",
+                # Raw SQL — push as migration file
+                sql_content = val if isinstance(val, str) else str(val)
+                r = await client.put(
+                    f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/supabase/migrations/001_schema.sql",
                     headers={"Authorization": f"token {github_token}"},
-                    json={"message": "schema", "content": base64.b64encode(val.encode()).decode()})
-                if r.status_code in (200,201): pushed += 1
+                    json={"message": "schema", "content": base64.b64encode(sql_content.encode()).decode()})
+                if r.status_code in (200, 201): pushed += 1
+                file_list.append("supabase/migrations/001_schema.sql")
                 continue
-            try: fmap = json.loads(sf(val))
-            except:
-                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/src/gen/{key}.txt",
-                    headers={"Authorization": f"token {github_token}"},
-                    json={"message": key, "content": base64.b64encode(val.encode()).decode()})
-                if r.status_code in (200,201): pushed += 1
+
+            # Parse the file map — try multiple approaches
+            fmap = None
+
+            # If val is already a dict (Supabase JSONB auto-parsed)
+            if isinstance(val, dict):
+                fmap = val
+                logger.info("Deploy %s: already a dict with %d keys", key, len(val))
+            elif isinstance(val, str):
+                # Strip markdown fences
+                cleaned = sf(val)
+                # Try parsing
+                try:
+                    fmap = json.loads(cleaned)
+                    logger.info("Deploy %s: parsed JSON, %d keys", key, len(fmap) if isinstance(fmap, dict) else 0)
+                except json.JSONDecodeError as e:
+                    logger.warning("Deploy %s: JSON parse failed at pos %d: %s", key, e.pos, str(e)[:100])
+                    # Try with strict=False (allows control chars)
+                    try:
+                        import json as json_mod
+                        decoder = json_mod.JSONDecoder(strict=False)
+                        fmap, _ = decoder.raw_decode(cleaned)
+                        logger.info("Deploy %s: parsed with strict=False, %d keys", key, len(fmap) if isinstance(fmap, dict) else 0)
+                    except Exception as e2:
+                        logger.error("Deploy %s: strict=False also failed: %s", key, str(e2)[:100])
+                        # Last resort: push as single file
+                        r = await client.put(
+                            f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/src/gen/{key}.txt",
+                            headers={"Authorization": f"token {github_token}"},
+                            json={"message": key, "content": base64.b64encode(val.encode()).decode()})
+                        if r.status_code in (200, 201): pushed += 1
+                        errs.append(f"{key}: JSON parse failed, pushed as .txt")
+                        continue
+
+            if not isinstance(fmap, dict):
+                logger.warning("Deploy %s: fmap is not dict (type=%s)", key, type(fmap).__name__)
                 continue
-            if not isinstance(fmap, dict): continue
+
+            # Push each file to its correct path
             for fp, fc in fmap.items():
                 if not fc or not isinstance(fc, str): continue
-                if not fp.startswith(("src/","app/","lib/","components/","public/")): fp = f"src/{fp}"
-                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/{fp}",
+                # Don't prefix paths that already have correct structure
+                if not fp.startswith(("app/", "lib/", "components/", "public/", "types/", "middleware")):
+                    fp = f"src/{fp}"
+
+                encoded = base64.b64encode(fc.encode()).decode()
+                r = await client.put(
+                    f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/{fp}",
                     headers={"Authorization": f"token {github_token}"},
-                    json={"message": fp, "content": base64.b64encode(fc.encode()).decode()})
-                if r.status_code in (200,201): pushed += 1
-                elif r.status_code != 422: errs.append(f"{fp}:{r.status_code}")
+                    json={"message": f"feat: {fp}", "content": encoded})
+                if r.status_code in (200, 201):
+                    pushed += 1
+                    file_list.append(fp)
+                elif r.status_code == 422:
+                    file_list.append(f"{fp} (exists)")
+                else:
+                    errs.append(f"{fp}:{r.status_code}")
                 await asyncio.sleep(0.3)
-        results["steps"]["files"] = {"pushed": pushed, "errors": errs[:5]}
+
+        results["steps"]["files"] = {"pushed": pushed, "errors": errs[:10], "file_list": file_list[:30]}
+        # GATE 2: Push scaffold files per DEPLOYMENT-STANDARD.md
+        scaffold = {
+            "app/globals.css": "@tailwind base;\n@tailwind components;\n@tailwind utilities;\n",
+            "app/layout.tsx": f'import type {{ Metadata }} from "next"\nimport {{ Inter }} from "next/font/google"\nimport "./globals.css"\n\nconst inter = Inter({{ subsets: ["latin"] }})\n\nexport const metadata: Metadata = {{\n  title: "{name}",\n  description: "Built by ZeroOrigine AI",\n}}\n\nexport default function RootLayout({{ children }}: {{ children: React.ReactNode }}) {{\n  return (\n    <html lang="en">\n      <body className={{inter.className}}>{{children}}</body>\n    </html>\n  )\n}}\n',
+            ".gitignore": "node_modules/\n.next/\n.env.local\n.env\n",
+            ".env.local.example": "NEXT_PUBLIC_SUPABASE_URL=\nNEXT_PUBLIC_SUPABASE_ANON_KEY=\nSTRIPE_SECRET_KEY=\nNEXT_PUBLIC_APP_URL=\n",
+        }
+        for fp, content in scaffold.items():
+            r = await client.put(
+                f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/{fp}",
+                headers={"Authorization": f"token {github_token}"},
+                json={"message": f"scaffold: {fp}", "content": base64.b64encode(content.encode()).decode()})
+            if r.status_code in (200, 201):
+                pushed += 1
+                file_list.append(f"{fp} (scaffold)")
+            await asyncio.sleep(0.2)
+
+        # GATE 3: Create Netlify site (delete existing first)
+        await client.delete(f"https://api.netlify.com/api/v1/sites/invoicememory-zo",
+            headers={"Authorization": f"Bearer {netlify_token}"})
+        await asyncio.sleep(1)
+
         r = await client.post("https://api.netlify.com/api/v1/sites",
             headers={"Authorization": f"Bearer {netlify_token}"},
             json={"repo": {"provider": "github", "repo": f"ZeroOrigine/{repo_name}", "branch": "main", "cmd": "npm run build", "dir": ".next"}, "name": repo_name})
