@@ -71,6 +71,92 @@ class ManualTriggerRequest(BaseModel):
 
 # ── Diagnostics ────────────────────────────────────────
 
+
+@app.post("/deploy/manual/{project_id}")
+async def deploy_manual(project_id: str):
+    import httpx
+    project = await db.get_project(project_id)
+    if not project:
+        return {"error": f"Project {project_id} not found"}
+    name = project.get("name", "unknown")
+    slug = name.lower().replace(" ", "-").replace("_", "-")
+    repo_name = f"zo-{slug}"
+    github_token = os.environ.get("GITHUB_TOKEN")
+    if not github_token:
+        try:
+            r = db.get_client().table("zo_config").select("value").eq("key", "GITHUB_TOKEN").execute()
+            github_token = r.data[0]["value"] if r.data else None
+        except: pass
+    netlify_token = os.environ.get("NETLIFY_API_TOKEN")
+    if not netlify_token:
+        try:
+            r = db.get_client().table("zo_config").select("value").eq("key", "NETLIFY_API_TOKEN").execute()
+            netlify_token = r.data[0]["value"] if r.data else None
+        except: pass
+    if not github_token: return {"error": "GITHUB_TOKEN missing"}
+    if not netlify_token: return {"error": "NETLIFY_API_TOKEN missing"}
+    results = {"project": name, "repo": repo_name, "steps": {}}
+    metadata = project.get("metadata", {})
+    if isinstance(metadata, str):
+        try: metadata = json.loads(metadata)
+        except: metadata = {}
+    artifacts = metadata.get("deploy_artifacts", metadata.get("code_for_qa", {}))
+    if not artifacts: return {"error": "No artifacts"}
+    def sf(s):
+        s = s.strip()
+        for p in ["```json\n", "```json", "```"]:
+            if s.startswith(p): s = s[len(p):]
+        if s.endswith("```"): s = s[:-3]
+        return s.strip()
+    async with httpx.AsyncClient(timeout=60) as client:
+        r = await client.post("https://api.github.com/repos/ZeroOrigine/zo-saas-template/generate",
+            headers={"Authorization": f"token {github_token}", "Accept": "application/vnd.github.baptiste-preview+json"},
+            json={"owner": "ZeroOrigine", "name": repo_name, "private": False})
+        results["steps"]["repo"] = "OK" if r.status_code == 201 else ("EXISTS" if r.status_code == 422 else f"FAIL:{r.status_code}")
+        await asyncio.sleep(5)
+        pushed, errs = 0, []
+        for key, val in artifacts.items():
+            if not val or not isinstance(val, str): continue
+            if key == "schema_sql":
+                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/supabase/migrations/001_schema.sql",
+                    headers={"Authorization": f"token {github_token}"},
+                    json={"message": "schema", "content": base64.b64encode(val.encode()).decode()})
+                if r.status_code in (200,201): pushed += 1
+                continue
+            try: fmap = json.loads(sf(val))
+            except:
+                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/src/gen/{key}.txt",
+                    headers={"Authorization": f"token {github_token}"},
+                    json={"message": key, "content": base64.b64encode(val.encode()).decode()})
+                if r.status_code in (200,201): pushed += 1
+                continue
+            if not isinstance(fmap, dict): continue
+            for fp, fc in fmap.items():
+                if not fc or not isinstance(fc, str): continue
+                if not fp.startswith(("src/","app/","lib/","components/","public/")): fp = f"src/{fp}"
+                r = await client.put(f"https://api.github.com/repos/ZeroOrigine/{repo_name}/contents/{fp}",
+                    headers={"Authorization": f"token {github_token}"},
+                    json={"message": fp, "content": base64.b64encode(fc.encode()).decode()})
+                if r.status_code in (200,201): pushed += 1
+                elif r.status_code != 422: errs.append(f"{fp}:{r.status_code}")
+                await asyncio.sleep(0.3)
+        results["steps"]["files"] = {"pushed": pushed, "errors": errs[:5]}
+        r = await client.post("https://api.netlify.com/api/v1/sites",
+            headers={"Authorization": f"Bearer {netlify_token}"},
+            json={"repo": {"provider": "github", "repo": f"ZeroOrigine/{repo_name}", "branch": "main", "cmd": "npm run build", "dir": ".next"}, "name": repo_name})
+        if r.status_code in (200,201):
+            d = r.json()
+            results["steps"]["netlify"] = "OK"
+            results["url"] = d.get("ssl_url", d.get("url", ""))
+        else: results["steps"]["netlify"] = f"FAIL:{r.status_code}"
+    try:
+        upd = {"status": "deployed"}
+        if results.get("url"): upd["netlify_url"] = results["url"]
+        db.get_client().table("zo_projects").update(upd).eq("project_id", project_id).execute()
+    except: pass
+    return results
+
+
 @app.get("/debug/deploy-artifacts/{project_id}")
 async def debug_deploy_artifacts(project_id: str):
     """Show deploy artifacts — what code exists for this project."""
