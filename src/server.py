@@ -70,6 +70,49 @@ class ManualTriggerRequest(BaseModel):
 
 # ── Diagnostics ────────────────────────────────────────
 
+@app.get("/debug/deploy-artifacts/{project_id}")
+async def debug_deploy_artifacts(project_id: str):
+    """Show deploy artifacts — what code exists for this project."""
+    project = await db.get_project(project_id)
+    if not project:
+        return {"error": f"Project {project_id} not found"}
+    metadata = project.get("metadata", {})
+    if isinstance(metadata, str):
+        try: metadata = json.loads(metadata)
+        except: metadata = {}
+
+    # Check both sources
+    deploy = metadata.get("deploy_artifacts", {})
+    code_qa = metadata.get("code_for_qa", {})
+    source = "deploy_artifacts" if deploy else "code_for_qa" if code_qa else "none"
+    artifacts = deploy or code_qa
+
+    if isinstance(artifacts, str):
+        try: artifacts = json.loads(artifacts)
+        except: artifacts = {}
+
+    result = {"project_id": project_id, "source": source, "artifacts": {}}
+    total = 0
+    for key, content in artifacts.items():
+        if isinstance(content, str):
+            # Try to parse JSON file maps
+            try:
+                parsed = json.loads(content.lstrip("`json\n").rstrip("`\n"))
+                files = list(parsed.keys()) if isinstance(parsed, dict) else []
+                result["artifacts"][key] = {
+                    "type": "file_map", "file_count": len(files),
+                    "files": files[:10], "total_chars": sum(len(v) for v in parsed.values()),
+                }
+                total += sum(len(v) for v in parsed.values())
+            except:
+                result["artifacts"][key] = {"type": "raw", "chars": len(content), "preview": content[:150]}
+                total += len(content)
+        else:
+            result["artifacts"][key] = {"type": type(content).__name__, "value": str(content)[:100]}
+    result["total_code_chars"] = total
+    return result
+
+
 @app.get("/debug/qa-dry-run/{project_id}")
 async def debug_qa_dry_run(project_id: str):
     """Show exactly what QA would receive — $0 cost, no Claude call."""
