@@ -11,7 +11,7 @@ import base64
 import json
 import logging
 import os
-import random
+import rando
 import string
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
@@ -1981,8 +1981,8 @@ async def _run_builder_safe(project_id: str, product_name: str):
     If any product is already building, this build is REFUSED.
     """
     import httpx
-    BOT_TOKEN = config.telegram_bot_token
-    CHAT_ID = config.telegram_chat_id
+    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
+    CHAT_ID = 8685703404
 
     # SEQUENTIAL BUILD ENFORCEMENT — one product at a time, no exceptions
     # Exclude THIS project (it was just set to 'building' by the caller)
@@ -2683,8 +2683,8 @@ async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
     """Run Hotfix pipeline in background with Telegram notification."""
     import httpx as _httpx
     import os
-    BOT_TOKEN = config.telegram_bot_token
-    CHAT_ID = config.telegram_chat_id
+    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
+    CHAT_ID = 8685703404
 
     async def notify(text: str):
         try:
@@ -2855,8 +2855,8 @@ async def _process_donation(session: dict):
     # Send Telegram notification
     import httpx
     import os
-    BOT_TOKEN = config.telegram_bot_token
-    CHAT_ID = config.telegram_chat_id
+    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
+    CHAT_ID = 8685703404
     new_label = "NEW MEMBER!" if is_new else "Returning supporter"
     try:
         async with httpx.AsyncClient() as http:
