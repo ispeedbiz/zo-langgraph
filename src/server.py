@@ -1985,8 +1985,9 @@ async def _run_builder_safe(project_id: str, product_name: str):
     CHAT_ID = config.telegram_chat_id
 
     # SEQUENTIAL BUILD ENFORCEMENT — one product at a time, no exceptions
+    # Exclude THIS project (it was just set to 'building' by the caller)
     try:
-        building = db.get_client().table("zo_projects").select("project_id,name").eq("status", "building").execute()
+        building = db.get_client().table("zo_projects").select("project_id,name").eq("status", "building").neq("project_id", project_id).execute()
         if building.data:
             already = building.data[0]
             logger.warning("BUILD REFUSED for %s — %s is already building. Sequential rule enforced.",
