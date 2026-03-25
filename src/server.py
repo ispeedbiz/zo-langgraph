@@ -4,14 +4,14 @@ Receives events from n8n webhooks and Telegram commands.
 Orchestrates all AI agent pipelines.
 
 v2.1 — Graphs wired. Every handler executes real LangGraph agents.
-""
+"""
 
 import asyncio
 import base64
 import json
 import logging
 import os
-import rando
+import random
 import string
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
