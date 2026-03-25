@@ -32,11 +32,11 @@ TOTAL_STEPS = 6  # 5 build steps + 1 self-validation
 # Token budget — no artificial ceiling. Builder gets room proportional to complexity.
 # Tier mapping: micro-saas = lean, standard = full, enterprise = generous.
 TIER_TOKEN_BUDGET = {
-    "micro-saas": 12000,   # Simple tools — fewer features, fewer files
-    "standard": 20000,     # Full SaaS — CRUD, payments, dashboards, auth
-    "enterprise": 32000,   # Complex products — multi-entity, workflows, integrations
+    "micro-saas": 100000,   # Simple tools — fewer features, fewer files
+    "standard": 100000,     # Full SaaS — CRUD, payments, dashboards, auth
+    "enterprise": 100000,   # Complex products — multi-entity, workflows, integrations
 }
-DEFAULT_TOKEN_BUDGET = 20000  # When tier is unknown, don't restrict
+DEFAULT_TOKEN_BUDGET = 100000  # When tier is unknown, don't restrict
 
 
 def _get_token_budget(state: dict) -> int:
