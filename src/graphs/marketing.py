@@ -544,11 +544,24 @@ async def emit_result(state: MarketingState) -> MarketingState:
         "total_cost_usd": state.get("total_cost_usd", 0),
     }
 
-    client.table("zo_marketing_content").upsert(
-        marketing_content, on_conflict="project_id"
-    ).execute()
-
-    logger.info("Marketing Mind: Stored all content for project %s", project_id)
+    try:
+        client.table("zo_marketing_content").upsert(
+            marketing_content, on_conflict="project_id"
+        ).execute()
+        logger.info("Marketing Mind: Stored all content for project %s", project_id)
+    except Exception as e:
+        logger.error("Marketing Mind: Failed to store content for %s: %s (keys: %s)",
+                     project_id, e, list(marketing_content.keys()))
+        # Fallback: store in zo_projects.metadata under marketing_content
+        try:
+            client.table("zo_projects").update({
+                "metadata": db.get_client().table("zo_projects").select("metadata").eq(
+                    "project_id", project_id).execute().data[0].get("metadata", {})
+                | {"marketing_content": marketing_content}
+            }).eq("project_id", project_id).execute()
+            logger.info("Marketing content saved to zo_projects.metadata as fallback")
+        except Exception as e2:
+            logger.error("Marketing fallback also failed: %s", e2)
 
     # Save checkpoint
     await db.save_checkpoint(

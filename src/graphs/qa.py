@@ -20,11 +20,14 @@ logger = logging.getLogger("zo.graphs.qa")
 
 # ── Constants ────────────────────────────────────────────────
 
-DEFAULT_PASS_THRESHOLD = 100
-CODE_REVIEW_THRESHOLD = 70  # Per-category: every category must hit 70% of its max
+DEFAULT_PASS_THRESHOLD = 119  # 85% of 140 — raised per PIPELINE-QUALITY-STANDARD.md
+CODE_REVIEW_THRESHOLD = 85   # Code review must also be rigorous (60% of 140)
 MAX_SCORE = 140
 DEFAULT_MAX_ROUNDS = 3
 MIN_CATEGORY_PERCENTAGE = 70  # Zero compromise — no category below 70%
+
+# P1 categories (Security, Core Functionality) must score 100%
+P1_CATEGORY_PERCENTAGE = 100  # Security and functionality cannot ship imperfect
 
 # Category max scores for per-category gate
 CATEGORY_MAX_SCORES = {
@@ -502,7 +505,10 @@ async def _run_tests(state: QAState) -> QAState:
             cat_score = cat_data.get("score", 0)
             cat_max = cat_data.get("max_score", CATEGORY_MAX_SCORES.get(cat_name, 20))
             cat_pct = (cat_score / cat_max * 100) if cat_max > 0 else 0
-            if cat_pct < MIN_CATEGORY_PERCENTAGE:
+            # P1 categories (security, functionality) must score 100%
+            is_p1 = cat_name.lower() in ("security", "functionality")
+            min_pct = P1_CATEGORY_PERCENTAGE if is_p1 else MIN_CATEGORY_PERCENTAGE
+            if cat_pct < min_pct:
                 failing_categories.append({
                     "category": cat_name,
                     "score": cat_score,

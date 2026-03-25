@@ -819,6 +819,26 @@ async def run_build_architect(project_id: str, project_data: dict) -> dict:
         "status": "starting",
     }
 
+    # P3.2: Check for existing manifest FIRST — skip BCM generation if manifest covers requirements
+    try:
+        client = db.get_client()
+        existing_manifest = client.table("zo_build_manifests").select("*").eq(
+            "project_id", project_id
+        ).execute()
+        if existing_manifest.data:
+            manifest = existing_manifest.data[0]
+            if manifest.get("pipeline_ready") and manifest.get("build_ready"):
+                logger.info("BCM manifest already exists for %s — skipping architect. Saved ~$0.09", project_id)
+                return {
+                    **initial_state,
+                    "build_ready": True,
+                    "pipeline_ready": True,
+                    "build_package": manifest,
+                    "status": "manifest_cached",
+                }
+    except Exception as e:
+        logger.warning("Failed to check existing manifest: %s — proceeding", e)
+
     graph = _build_graph()
     compiled = graph.compile()
 

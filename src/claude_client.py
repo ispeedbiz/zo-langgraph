@@ -108,6 +108,22 @@ class ClaudeClient:
             notes=f"temp={temperature}",
         )
 
+        # Log to zo_mind_logs (P3.3) — every Mind call tracked
+        try:
+            db.get_client().table("zo_mind_logs").insert({
+                "mind_name": agent_name,
+                "action": workflow,
+                "model": model,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+                "cost_usd": cost,
+                "project_id": project_id,
+                "input_summary": user_message[:200] if user_message else "",
+                "output_summary": "",  # Filled after text extraction
+            }).execute()
+        except Exception:
+            pass  # Mind logging is non-blocking
+
         # Check cost alert threshold
         threshold = float(await db.get_config("cost_alert_threshold_cad", "5.00"))
         cost_cad = cost * 1.38  # Approximate USD to CAD
