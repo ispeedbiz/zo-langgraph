@@ -13,8 +13,8 @@ load_dotenv()
 @dataclass
 class ModelTier:
     """Claude API model tier configuration."""
-    opus: str = "claude-opus-4-20250514"
-    sonnet: str = "claude-sonnet-4-20250514"
+    opus: str = "claude-opus-4-6"
+    sonnet: str = "claude-sonnet-4-6"
     haiku: str = "claude-haiku-4-5-20251001"
 
     # Cost per million tokens (USD)
