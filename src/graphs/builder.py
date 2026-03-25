@@ -717,6 +717,13 @@ async def step_1_schema(state: BuildState) -> BuildState:
 
     state = accumulate_cost(state, response)
 
+    # Halt on API error — don't store empty content
+    if response.get("error"):
+        state["error"] = f"API error in step 1: {response['error']}"
+        state["status"] = "failed"
+        logger.error("Step 1 failed: %s", response["error"][:200])
+        return state
+
     # Extract SQL from code block
     content = response["content"]
     import re
@@ -766,6 +773,13 @@ async def step_2_api(state: BuildState) -> BuildState:
     )
 
     state = accumulate_cost(state, response)
+
+    # Halt on API error — don't store empty content
+    if response.get("error"):
+        state["error"] = f"API error in step 2: {response['error']}"
+        state["status"] = "failed"
+        logger.error("Step 2 failed: %s", response["error"][:200])
+        return state
 
     # Extract JSON or fall back to raw content
     parsed = extract_json(response["content"])
@@ -821,6 +835,13 @@ async def step_3_core(state: BuildState) -> BuildState:
 
     state = accumulate_cost(state, response)
 
+    # Halt on API error — don't store empty content
+    if response.get("error"):
+        state["error"] = f"API error in step 3: {response['error']}"
+        state["status"] = "failed"
+        logger.error("Step 3 failed: %s", response["error"][:200])
+        return state
+
     parsed = extract_json(response["content"])
     if parsed and isinstance(parsed, dict):
         state["core_code"] = json.dumps(parsed, indent=2)
@@ -872,6 +893,13 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
 
     state = accumulate_cost(state, response)
 
+    # Halt on API error — don't store empty content
+    if response.get("error"):
+        state["error"] = f"API error in step 4: {response['error']}"
+        state["status"] = "failed"
+        logger.error("Step 4 failed: %s", response["error"][:200])
+        return state
+
     parsed = extract_json(response["content"])
     if parsed and isinstance(parsed, dict):
         state["auth_payments_code"] = json.dumps(parsed, indent=2)
@@ -922,6 +950,13 @@ async def step_5_landing(state: BuildState) -> BuildState:
     )
 
     state = accumulate_cost(state, response)
+
+    # Halt on API error — don't store empty content
+    if response.get("error"):
+        state["error"] = f"API error in step 5: {response['error']}"
+        state["status"] = "failed"
+        logger.error("Step 5 failed: %s", response["error"][:200])
+        return state
 
     parsed = extract_json(response["content"])
     if parsed and isinstance(parsed, dict):
