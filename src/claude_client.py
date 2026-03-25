@@ -6,6 +6,7 @@ Claude API wrapper with:
   - Automatic token usage logging
   - Cost calculation and alerting
   - Error capture to zo_mind_logs + metadata
+  - Retry with backoff for transient errors (500, 529)
 """
 
 import anthropic
@@ -27,6 +28,7 @@ AGENT_EFFORT = {
     "builder_step4": "max",
     "builder_step5": "max",
     "builder_step6": "max",
+    "builder_opus": "max",
     "research_a": "high",
     "research_b": "high",
     "ethics": "high",
@@ -38,9 +40,14 @@ AGENT_EFFORT = {
     "hotfix_verify": "medium",
 }
 
+# Retry config: transient errors get retried, client errors don't
+RETRYABLE_STATUS_CODES = {500, 502, 503, 529}
+MAX_RETRIES = 3
+RETRY_DELAYS = [30, 60, 120]  # seconds — exponential backoff
+
 
 class ClaudeClient:
-    """Tiered, cost-tracked Claude API client with adaptive thinking."""
+    """Tiered, cost-tracked Claude API client with adaptive thinking and retry."""
 
     def __init__(self):
         self.client = anthropic.AsyncAnthropic(
@@ -60,7 +67,7 @@ class ClaudeClient:
         use_cache: bool = True,
         extra_context: str | None = None,
     ) -> dict[str, Any]:
-        """Call Claude with adaptive thinking, effort parameter, and error capture."""
+        """Call Claude with adaptive thinking, effort parameter, retry, and error capture."""
 
         # Determine model tier and effort
         tier = AGENT_MODEL_MAP.get(agent_name, "sonnet")
@@ -106,26 +113,57 @@ class ClaudeClient:
             agent_name, model, tier, effort, max_tokens,
         )
 
-        # === STEP 3: Error capture on every API call ===
-        try:
-            response = await self.client.messages.create(**api_kwargs)
-        except anthropic.BadRequestError as e:
-            error_msg = f"400 BadRequest for {agent_name}: {str(e)[:300]}"
-            logger.error(error_msg)
-            await self._log_error(agent_name, workflow, project_id, error_msg)
-            return self._error_response(model, tier, error_msg)
-        except anthropic.RateLimitError as e:
-            error_msg = f"429 RateLimit for {agent_name}: {str(e)[:200]}"
-            logger.error(error_msg)
-            await self._log_error(agent_name, workflow, project_id, error_msg)
-            return self._error_response(model, tier, error_msg)
-        except anthropic.APIStatusError as e:
-            error_msg = f"API error {e.status_code} for {agent_name}: {str(e)[:300]}"
-            logger.error(error_msg)
-            await self._log_error(agent_name, workflow, project_id, error_msg)
-            return self._error_response(model, tier, error_msg)
-        except Exception as e:
-            error_msg = f"Unexpected error for {agent_name}: {str(e)[:300]}\n{traceback.format_exc()[:500]}"
+        # === API call with retry for transient errors ===
+        last_error = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = await self.client.messages.create(**api_kwargs)
+                break  # Success — exit retry loop
+            except anthropic.BadRequestError as e:
+                # 400 = client error, do NOT retry
+                error_msg = f"400 BadRequest for {agent_name}: {str(e)[:300]}"
+                logger.error(error_msg)
+                await self._log_error(agent_name, workflow, project_id, error_msg)
+                return self._error_response(model, tier, error_msg)
+            except anthropic.RateLimitError as e:
+                # 429 = rate limit, retry with backoff
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    delay = RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "429 RateLimit for %s (attempt %d/%d), retrying in %ds...",
+                        agent_name, attempt + 1, MAX_RETRIES, delay,
+                    )
+                    await self._log_retry(agent_name, workflow, project_id, attempt + 1, f"429: {str(e)[:100]}")
+                    await asyncio.sleep(delay)
+                    continue
+                error_msg = f"429 RateLimit for {agent_name} after {MAX_RETRIES} retries: {str(e)[:200]}"
+                logger.error(error_msg)
+                await self._log_error(agent_name, workflow, project_id, error_msg)
+                return self._error_response(model, tier, error_msg)
+            except anthropic.APIStatusError as e:
+                last_error = e
+                if e.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES:
+                    delay = RETRY_DELAYS[attempt]
+                    logger.warning(
+                        "API %d for %s (attempt %d/%d), retrying in %ds...",
+                        e.status_code, agent_name, attempt + 1, MAX_RETRIES, delay,
+                    )
+                    await self._log_retry(agent_name, workflow, project_id, attempt + 1, f"{e.status_code}: {str(e)[:100]}")
+                    await asyncio.sleep(delay)
+                    continue
+                error_msg = f"API error {e.status_code} for {agent_name}: {str(e)[:300]}"
+                logger.error(error_msg)
+                await self._log_error(agent_name, workflow, project_id, error_msg)
+                return self._error_response(model, tier, error_msg)
+            except Exception as e:
+                error_msg = f"Unexpected error for {agent_name}: {str(e)[:300]}\n{traceback.format_exc()[:500]}"
+                logger.error(error_msg)
+                await self._log_error(agent_name, workflow, project_id, error_msg)
+                return self._error_response(model, tier, error_msg)
+        else:
+            # All retries exhausted
+            error_msg = f"All {MAX_RETRIES} retries exhausted for {agent_name}: {str(last_error)[:300]}"
             logger.error(error_msg)
             await self._log_error(agent_name, workflow, project_id, error_msg)
             return self._error_response(model, tier, error_msg)
@@ -163,20 +201,21 @@ class ClaudeClient:
                 thinking_content += block.thinking
 
         # Log to zo_mind_logs (every Mind call tracked)
+        # Column names match actual schema: tokens_used, error_message, status
         try:
             db.get_client().table("zo_mind_logs").insert({
                 "mind_name": agent_name,
                 "action": workflow,
-                "model": model,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
+                "tokens_used": input_tokens + output_tokens,
                 "cost_usd": cost,
                 "project_id": project_id,
+                "status": "success",
+                "error_message": None,
                 "input_summary": user_message[:200] if user_message else "",
                 "output_summary": text_content[:200] if text_content else "",
             }).execute()
-        except Exception:
-            pass  # Non-blocking
+        except Exception as exc:
+            logger.warning("Failed to log to zo_mind_logs: %s", str(exc)[:100])
 
         # Cost alert
         try:
@@ -211,32 +250,45 @@ class ClaudeClient:
             "error": None,
         }
 
+    async def _log_retry(self, agent_name: str, workflow: str, project_id: str | None, attempt: int, reason: str):
+        """Log retry attempts to zo_mind_logs."""
+        try:
+            db.get_client().table("zo_mind_logs").insert({
+                "mind_name": agent_name,
+                "action": workflow,
+                "tokens_used": 0,
+                "cost_usd": 0,
+                "project_id": project_id,
+                "status": "retry",
+                "error_message": f"Retry {attempt}/{MAX_RETRIES}: {reason}",
+                "input_summary": f"retry_attempt_{attempt}",
+                "output_summary": "",
+            }).execute()
+        except Exception:
+            pass
+
     async def _log_error(self, agent_name: str, workflow: str, project_id: str | None, error_msg: str):
         """Log API errors to zo_mind_logs and project metadata."""
         try:
             db.get_client().table("zo_mind_logs").insert({
                 "mind_name": agent_name,
                 "action": workflow,
-                "model": "error",
-                "input_tokens": 0,
-                "output_tokens": 0,
+                "tokens_used": 0,
                 "cost_usd": 0,
                 "project_id": project_id,
+                "status": "error",
+                "error_message": error_msg[:500],
                 "input_summary": "API ERROR",
                 "output_summary": error_msg[:200],
             }).execute()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to log error to zo_mind_logs: %s", str(exc)[:100])
 
-        # Also write to project metadata.error if project_id exists
+        # Write error to project metadata
         if project_id:
             try:
                 db.get_client().table("zo_projects").update({
-                    "metadata": db.get_client().rpc("jsonb_set_nested", {
-                        "target": "metadata",
-                        "path": "{error}",
-                        "value": f'"{error_msg[:200]}"',
-                    }).execute() if False else None,  # RPC may not exist, use direct update
+                    "metadata": {"error": error_msg[:200]},
                 }).eq("project_id", project_id).execute()
             except Exception:
                 pass
