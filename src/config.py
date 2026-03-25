@@ -18,12 +18,12 @@ class ModelTier:
     haiku: str = "claude-haiku-4-5-20251001"
 
     # Cost per million tokens (USD)
-    opus_input_cost: float = 15.0
-    opus_output_cost: float = 75.0
+    opus_input_cost: float = 5.0
+    opus_output_cost: float = 25.0
     sonnet_input_cost: float = 3.0
     sonnet_output_cost: float = 15.0
-    haiku_input_cost: float = 0.80
-    haiku_output_cost: float = 4.0
+    haiku_input_cost: float = 1.0
+    haiku_output_cost: float = 5.0
 
     # Cached input tokens are 90% cheaper
     cache_discount: float = 0.10  # pay 10% of normal input cost
@@ -45,19 +45,18 @@ class ModelTier:
 
 
 # Agent → Model Tier mapping
-# Research A + Ethics = deep reasoning → Opus
-# Builder, QA, Marketing, Research B = creative competence → Sonnet
-# Dispatcher, Support, JSON extraction = fast utility → Haiku
+# Opus 4.6 everywhere — full creative freedom → Opus
+# Only status_check and json_extract stay on Haiku (simple utility tasks)
 AGENT_MODEL_MAP: dict[str, str] = {
     "research_a": "opus",
     "ethics": "opus",
-    "research_b": "sonnet",
-    "builder": "sonnet",
+    "research_b": "opus",
+    "builder": "opus",
     "builder_opus": "opus",
-    "qa": "sonnet",
-    "marketing": "sonnet",
-    "dispatcher": "haiku",
-    "support": "haiku",
+    "qa": "opus",
+    "marketing": "opus",
+    "dispatcher": "opus",
+    "support": "opus",
     "status_check": "haiku",
     "json_extract": "haiku",
 }
