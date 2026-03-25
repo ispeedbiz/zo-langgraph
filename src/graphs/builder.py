@@ -226,6 +226,26 @@ a {category} SaaS product.
 
 Product description: {description}
 
+## CRITICAL: INLINE-FIRST ARCHITECTURE
+Generate each page as a SINGLE self-contained file. ALL components, styles, and logic
+must be INLINE in the file. Do NOT create separate component files. Do NOT import from
+local component paths like "./components/Header" — those files will NOT exist.
+
+ALLOWED imports ONLY:
+- node_modules (next, react, @supabase, stripe, tailwindcss classes)
+- Next.js built-ins (Image, Link, redirect, cookies, headers)
+- ../lib/* (utility files you generate in the same step)
+
+FORBIDDEN imports:
+- ./components/* (these files will not exist)
+- ./sections/* (these files will not exist)
+- Any relative import to a file you did not generate in THIS step
+
+If a page needs a navbar, footer, or section — write the JSX INLINE in that page file.
+A 300-line page.tsx with inline components is CORRECT.
+A 30-line page.tsx that imports 10 components from ./components/ is BROKEN.
+
+
 REQUIREMENTS:
 
 1. ROUTE STRUCTURE
@@ -309,6 +329,26 @@ After designing the feature set, remove 30%% of it. Ship the knife, not the Swis
 multi-tool.
 
 Product description: {description}
+
+## CRITICAL: INLINE-FIRST ARCHITECTURE
+Generate each page as a SINGLE self-contained file. ALL components, styles, and logic
+must be INLINE in the file. Do NOT create separate component files. Do NOT import from
+local component paths like "./components/Header" — those files will NOT exist.
+
+ALLOWED imports ONLY:
+- node_modules (next, react, @supabase, stripe, tailwindcss classes)
+- Next.js built-ins (Image, Link, redirect, cookies, headers)
+- ../lib/* (utility files you generate in the same step)
+
+FORBIDDEN imports:
+- ./components/* (these files will not exist)
+- ./sections/* (these files will not exist)
+- Any relative import to a file you did not generate in THIS step
+
+If a page needs a navbar, footer, or section — write the JSX INLINE in that page file.
+A 300-line page.tsx with inline components is CORRECT.
+A 30-line page.tsx that imports 10 components from ./components/ is BROKEN.
+
 
 You have ALREADY generated:
 - The database schema (provided below)
@@ -403,6 +443,26 @@ YOUR TASK: Generate the authentication and Stripe payments integration for
 "{name}", a {category} SaaS product.
 
 Product description: {description}
+
+## CRITICAL: INLINE-FIRST ARCHITECTURE
+Generate each page as a SINGLE self-contained file. ALL components, styles, and logic
+must be INLINE in the file. Do NOT create separate component files. Do NOT import from
+local component paths like "./components/Header" — those files will NOT exist.
+
+ALLOWED imports ONLY:
+- node_modules (next, react, @supabase, stripe, tailwindcss classes)
+- Next.js built-ins (Image, Link, redirect, cookies, headers)
+- ../lib/* (utility files you generate in the same step)
+
+FORBIDDEN imports:
+- ./components/* (these files will not exist)
+- ./sections/* (these files will not exist)
+- Any relative import to a file you did not generate in THIS step
+
+If a page needs a navbar, footer, or section — write the JSX INLINE in that page file.
+A 300-line page.tsx with inline components is CORRECT.
+A 30-line page.tsx that imports 10 components from ./components/ is BROKEN.
+
 
 REQUIREMENTS:
 
@@ -502,6 +562,26 @@ YOUR TASK: Generate a high-converting landing page for "{name}", a {category}
 SaaS product.
 
 Product description: {description}
+
+## CRITICAL: INLINE-FIRST ARCHITECTURE
+Generate each page as a SINGLE self-contained file. ALL components, styles, and logic
+must be INLINE in the file. Do NOT create separate component files. Do NOT import from
+local component paths like "./components/Header" — those files will NOT exist.
+
+ALLOWED imports ONLY:
+- node_modules (next, react, @supabase, stripe, tailwindcss classes)
+- Next.js built-ins (Image, Link, redirect, cookies, headers)
+- ../lib/* (utility files you generate in the same step)
+
+FORBIDDEN imports:
+- ./components/* (these files will not exist)
+- ./sections/* (these files will not exist)
+- Any relative import to a file you did not generate in THIS step
+
+If a page needs a navbar, footer, or section — write the JSX INLINE in that page file.
+A 300-line page.tsx with inline components is CORRECT.
+A 30-line page.tsx that imports 10 components from ./components/ is BROKEN.
+
 
 REQUIREMENTS:
 
@@ -675,7 +755,7 @@ async def step_2_api(state: BuildState) -> BuildState:
     )
 
     response = await claude.call(
-        agent_name="builder",
+        agent_name="builder_opus",
         system_prompt=system,
         user_message=user_msg,
         project_id=state["project_id"],
@@ -729,7 +809,7 @@ async def step_3_core(state: BuildState) -> BuildState:
     )
 
     response = await claude.call(
-        agent_name="builder",
+        agent_name="builder_opus",
         system_prompt=system,
         user_message=user_msg,
         project_id=state["project_id"],
@@ -780,7 +860,7 @@ async def step_4_auth_payments(state: BuildState) -> BuildState:
     )
 
     response = await claude.call(
-        agent_name="builder",
+        agent_name="builder_opus",
         system_prompt=system,
         user_message=user_msg,
         project_id=state["project_id"],
@@ -1010,10 +1090,32 @@ async def step_6_self_validate(state: BuildState) -> BuildState:
         elif isinstance(patch, str) and patch.strip():
             state[key] = (state.get(key, "") or "") + "\n" + patch
 
+    # P1.4: Additional programmatic checks (don't rely only on Claude's opinion)
+    import re
+    structural_issues = []
+
+    for key in ("api_code", "core_code", "auth_payments_code", "landing_page"):
+        code = state.get(key, "")
+        if not code:
+            structural_issues.append(f"{key}: EMPTY")
+            continue
+        if len(code) < 100:
+            structural_issues.append(f"{key}: too short ({len(code)} chars)")
+
+        # Check for forbidden local imports
+        local_imports = re.findall(r'from\s+["\']\./(components|sections|hooks|utils)/[^"\']+["\']', code)
+        if local_imports:
+            structural_issues.append(f"{key}: has {len(local_imports)} forbidden local imports: {local_imports[:3]}")
+
+    if structural_issues:
+        logger.warning("Self-validation structural issues: %s", structural_issues)
+        confidence = min(confidence, 60)
+
     state["self_validation"] = {
         "confidence_score": confidence,
-        "gaps_found": gaps,
+        "gaps_found": gaps + structural_issues,
         "patches_applied": sum(1 for v in patches.values() if v),
+        "structural_issues": structural_issues,
     }
 
     await _save_step_checkpoint(state, step, "step_6_self_validate")
@@ -1062,25 +1164,52 @@ async def emit_result(state: BuildState) -> BuildState:
     """Emit the build_complete event so downstream agents can pick it up."""
     state["status"] = "complete"
 
-    # Store code artifacts in zo_projects.metadata (NOT in event payload)
-    # pg_net has 8KB limit on webhook payloads — code would exceed it
+    # ATOMIC ARTIFACT STORAGE (P1.3)
+    # Collect ALL artifacts, validate, write once. No partial writes.
+    artifacts = {
+        "schema_sql": state.get("schema_sql", "") or "",
+        "api_code": state.get("api_code", "") or "",
+        "core_code": state.get("core_code", "") or "",
+        "auth_payments_code": state.get("auth_payments_code", "") or "",
+        "landing_page": state.get("landing_page", "") or "",
+    }
+
+    # Validate: every artifact must have content
+    empty_artifacts = [k for k, v in artifacts.items() if not v or len(v) < 50]
+    if empty_artifacts:
+        logger.error("ATOMIC CHECK FAILED: empty artifacts: %s", empty_artifacts)
+        state["error"] = f"Build incomplete — empty artifacts: {empty_artifacts}"
+        state["status"] = "failed"
+        return state
+
+    total_chars = sum(len(v) for v in artifacts.values())
+    if total_chars < 5000:
+        logger.error("ATOMIC CHECK FAILED: total chars too low (%d)", total_chars)
+        state["error"] = f"Build output too small ({total_chars} chars) — likely truncated"
+        state["status"] = "failed"
+        return state
+
+    # Store BOTH deploy_artifacts (full) and code_for_qa (truncated for QA)
+    deploy_artifacts = dict(artifacts)  # Full copy
+    code_for_qa = {k: v[:6000] for k, v in artifacts.items()}  # Truncated for QA
+
     try:
-        code_for_qa = {
-            "schema_sql": state.get("schema_sql", "") or "",
-            "api_code": state.get("api_code", "") or "",
-            "core_code": state.get("core_code", "") or "",
-            "auth_payments_code": state.get("auth_payments_code", "") or "",
-            "landing_page": state.get("landing_page", "") or "",
-        }
-        # Pass dict directly — Supabase client handles JSON serialization
-        # DO NOT use json.dumps() — causes double-serialization
         db.get_client().table("zo_projects").update({
-            "metadata": {"code_for_qa": code_for_qa, "build_stage": "complete"},
+            "metadata": {
+                "deploy_artifacts": deploy_artifacts,
+                "code_for_qa": code_for_qa,
+                "build_stage": "complete",
+                "total_chars": total_chars,
+                "self_validation": state.get("self_validation", {}),
+            },
         }).eq("project_id", state["project_id"]).execute()
-        logger.info("Code artifacts saved to zo_projects.metadata for QA (%d total chars)",
-                     sum(len(v) for v in code_for_qa.values()))
+        logger.info("ATOMIC WRITE: All artifacts saved to metadata (%d chars, %d artifacts)",
+                     total_chars, len(artifacts))
     except Exception as e:
-        logger.error("Failed to save code artifacts to metadata: %s", e)
+        logger.error("ATOMIC WRITE FAILED: %s", e)
+        state["error"] = f"Failed to save artifacts: {e}"
+        state["status"] = "failed"
+        return state
 
     # Event payload stays SMALL (under 8KB for pg_net)
     payload: dict[str, Any] = {

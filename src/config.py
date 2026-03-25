@@ -53,6 +53,7 @@ AGENT_MODEL_MAP: dict[str, str] = {
     "ethics": "opus",
     "research_b": "sonnet",
     "builder": "sonnet",
+    "builder_opus": "opus",
     "qa": "sonnet",
     "marketing": "sonnet",
     "dispatcher": "haiku",
