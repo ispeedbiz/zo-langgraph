@@ -4,7 +4,7 @@ Receives events from n8n webhooks and Telegram commands.
 Orchestrates all AI agent pipelines.
 
 v2.1 — Graphs wired. Every handler executes real LangGraph agents.
-"""
+""
 
 import asyncio
 import base64
@@ -1981,8 +1981,8 @@ async def _run_builder_safe(project_id: str, product_name: str):
     If any product is already building, this build is REFUSED.
     """
     import httpx
-    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
-    CHAT_ID = 8685703404
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
 
     # SEQUENTIAL BUILD ENFORCEMENT — one product at a time, no exceptions
     # Exclude THIS project (it was just set to 'building' by the caller)
@@ -2683,8 +2683,8 @@ async def _run_hotfix_safe(project_id: str, product_name: str, issue: str):
     """Run Hotfix pipeline in background with Telegram notification."""
     import httpx as _httpx
     import os
-    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
-    CHAT_ID = 8685703404
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
 
     async def notify(text: str):
         try:
@@ -2855,8 +2855,8 @@ async def _process_donation(session: dict):
     # Send Telegram notification
     import httpx
     import os
-    BOT_TOKEN = 8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s
-    CHAT_ID = 8685703404
+    BOT_TOKEN = "8709805835:AAHFzOigns7exjVBgNlRTJBbNfFjuV1uK8s"
+    CHAT_ID = "8685703404"
     new_label = "NEW MEMBER!" if is_new else "Returning supporter"
     try:
         async with httpx.AsyncClient() as http:
