@@ -39,7 +39,7 @@ class EthicsState(TypedDict, total=False):
     ideas: list[dict]
     evaluations: list[dict]
     reviews: list[dict]
-    reviews_raw: str  # Raw Claude response text — MUST be in TypedDict or LangGraph drops it
+    reviews_raw: str  # Raw Claude response text
     reviews_raw_length: int
     ideas_for_review_count: int
     approved: list[dict]
@@ -94,7 +94,7 @@ class QAState(TypedDict, total=False):
     # Pipeline Architect QA context (BCMs for QA)
     qa_context: dict
     # QA results by category
-    test_results: dict[str, dict]  # category → {passed, score, issues}
+    test_results: dict[str, dict]  # category -> {passed, score, issues}
     overall_score: int
     max_score: int
     pass_threshold: int
@@ -136,35 +136,46 @@ class MarketingState(TypedDict, total=False):
 # ── JSON Extraction Utilities ─────────────────────────────
 
 def extract_json(text: str) -> dict | list | None:
-    """Extract JSON from Claude's response, handling code blocks, multi-block
-    web search responses, and raw JSON.  Tries multiple strategies."""
+    """Extract JSON from Claude's response.  Robust against code fences,
+    embedded backticks in generated code, and truncated output."""
 
     if not text or not text.strip():
         logger.warning("extract_json: empty input text")
         return None
 
-    # Method 1: Code block (most reliable — Claude wraps JSON here)
+    cleaned = text.strip()
+
+    # Method 0: Strip leading/trailing code fences (handles embedded backticks)
+    if cleaned.startswith("```"):
+        first_newline = cleaned.find("\n")
+        if first_newline != -1:
+            cleaned = cleaned[first_newline + 1:]
+        last_fence = cleaned.rfind("```")
+        if last_fence != -1:
+            cleaned = cleaned[:last_fence]
+        cleaned = cleaned.strip()
+
+    # Method 1: Try direct JSON parse on cleaned text
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+
+    # Method 2: Try with strict=False (handles control chars in strings)
+    try:
+        return json.loads(cleaned, strict=False)
+    except json.JSONDecodeError:
+        pass
+
+    # Method 3: Regex code block (fallback for simpler cases)
     code_match = re.search(r'```json?\s*([\s\S]*?)```', text)
     if code_match:
         try:
             return json.loads(code_match.group(1))
         except json.JSONDecodeError as e:
-            logger.warning("extract_json: code block found but invalid JSON: %s", e)
+            logger.warning("extract_json: code block regex found but invalid JSON: %s", e)
 
-    # Method 2: Find a JSON array containing objects with "name" field
-    # This is specific to idea/evaluation arrays — the most common case
-    arr_matches = re.finditer(r'\[[\s\S]*?\]', text)
-    for match in arr_matches:
-        try:
-            parsed = json.loads(match.group(0))
-            if isinstance(parsed, list) and parsed and isinstance(parsed[0], dict):
-                if "name" in parsed[0]:  # Looks like an ideas array
-                    logger.info("extract_json: found ideas array with %d items", len(parsed))
-                    return parsed
-        except json.JSONDecodeError:
-            continue
-
-    # Method 3: Find JSON object with "ideas" key
+    # Method 4: Find JSON object with common keys
     obj_matches = re.finditer(r'\{[\s\S]*?\}', text)
     for match in obj_matches:
         candidate = match.group(0)
@@ -172,12 +183,11 @@ def extract_json(text: str) -> dict | list | None:
             try:
                 parsed = json.loads(candidate)
                 if isinstance(parsed, dict):
-                    logger.info("extract_json: found JSON object with keys %s", list(parsed.keys())[:5])
                     return parsed
             except json.JSONDecodeError:
                 continue
 
-    # Method 4: Greedy — largest JSON object in the text
+    # Method 5: Greedy — largest JSON object
     obj_match = re.search(r'\{[\s\S]*\}', text)
     if obj_match:
         try:
@@ -185,13 +195,25 @@ def extract_json(text: str) -> dict | list | None:
         except json.JSONDecodeError:
             pass
 
-    # Method 5: Greedy — largest JSON array
+    # Method 6: Greedy — largest JSON array
     arr_match = re.search(r'\[[\s\S]*\]', text)
     if arr_match:
         try:
             return json.loads(arr_match.group(0))
         except json.JSONDecodeError:
             pass
+
+    # Method 7: Truncation repair — if JSON was cut off, try closing braces
+    if cleaned.startswith("{"):
+        open_braces = cleaned.count("{") - cleaned.count("}")
+        if open_braces > 0:
+            repaired = cleaned + "}" * open_braces
+            try:
+                result = json.loads(repaired)
+                logger.warning("extract_json: repaired truncated JSON (added %d closing braces)", open_braces)
+                return result
+            except json.JSONDecodeError:
+                pass
 
     logger.error("extract_json: ALL methods failed on %d chars. Preview: %.200s", len(text), text[:200])
     return None
